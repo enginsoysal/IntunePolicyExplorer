@@ -1,0 +1,22 @@
+# PowerShell
+*.ps1xml
+
+# Local / IDE
+.vscode/
+.idea/
+*.user
+*.suo
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Secrets
+*.env
+.env.*
+secrets.*
+
+# Build / publish artifacts
+*.nupkg
+publish/
