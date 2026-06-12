@@ -72,6 +72,44 @@ function Test-HasIntuneGraphSession {
     return (@($Context.Scopes | Where-Object { $_ -match '^(DeviceManagement|Policy\.)' }).Count -gt 0)
 }
 
+function Test-MgCommandSupportsContextScope {
+    param([string]$CommandName)
+    $cmd = Get-Command $CommandName -ErrorAction SilentlyContinue
+    return ($cmd -and $cmd.Parameters.ContainsKey('ContextScope'))
+}
+
+function Get-MgGraphSession {
+    if (Test-MgCommandSupportsContextScope -CommandName 'Get-MgContext') {
+        try {
+            $ctx = Get-MgContext -ContextScope CurrentUser -ErrorAction Stop
+            if ($ctx) { return $ctx }
+        }
+        catch { }
+    }
+    return Get-MgContext -ErrorAction SilentlyContinue
+}
+
+function Invoke-ConnectMgGraph {
+    param(
+        [string]$ClientId,
+        [string]$TenantId,
+        [string[]]$Scopes
+    )
+
+    $params = @{
+        Scopes      = $Scopes
+        NoWelcome   = $true
+        ErrorAction = 'Stop'
+    }
+    if ($ClientId) { $params.ClientId = $ClientId }
+    if ($TenantId) { $params.TenantId = $TenantId }
+    if (Test-MgCommandSupportsContextScope -CommandName 'Connect-MgGraph') {
+        $params.ContextScope = 'CurrentUser'
+    }
+    Connect-MgGraph @params
+    return Get-MgGraphSession
+}
+
 $Script:PolicySources = [ordered]@{
     'Configuration Profiles'     = @{ Endpoint = 'deviceManagement/deviceConfigurations';              DetailExpand = $null }
     'Settings Catalog'           = @{ Endpoint = 'deviceManagement/configurationPolicies';            DetailExpand = 'settings' }
@@ -285,6 +323,47 @@ function Get-AccessTokenViaDeviceCode {
     }
 }
 
+function Connect-ToGraphViaBrowserHost {
+    param(
+        [string]$TenantId,
+        [string]$ClientId,
+        [string[]]$Scopes
+    )
+
+    $escapedClient = $ClientId.Replace("'", "''")
+    $escapedTenant = $TenantId.Replace("'", "''")
+    $scopeArray    = ($Scopes | ForEach-Object { "'$($_.Replace("'", "''"))'" }) -join ', '
+
+    if (-not (Test-MgCommandSupportsContextScope -CommandName 'Connect-MgGraph')) {
+        throw [System.InvalidOperationException]::new(
+            'Browser sign-in fallback requires a newer Microsoft.Graph.Authentication module.`n`n' +
+            'Run: Update-Module Microsoft.Graph.Authentication -Scope CurrentUser -Force')
+    }
+
+    $connectScript = @"
+`$ErrorActionPreference = 'Stop'
+Import-Module Microsoft.Graph.Authentication
+Set-MgGraphOption -EnableLoginByWAM `$false | Out-Null
+Connect-MgGraph -ClientId '$escapedClient' -TenantId '$escapedTenant' -Scopes @($scopeArray) -ContextScope CurrentUser -NoWelcome
+"@
+
+    $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($connectScript))
+    $proc = Start-Process -FilePath 'powershell.exe' `
+        -ArgumentList "-NoProfile -STA -EncodedCommand $encoded" `
+        -PassThru -Wait -WindowStyle Normal
+
+    Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
+    $context = Get-MgGraphSession
+    if (-not $context) {
+        throw [System.InvalidOperationException]::new(
+            'Browser sign-in did not complete. Sign in via the opened PowerShell window, approve permissions, and try again.')
+    }
+    if ($proc.ExitCode -and $proc.ExitCode -ne 0) {
+        throw [System.InvalidOperationException]::new('Browser sign-in was cancelled or failed.')
+    }
+    return $context
+}
+
 function Connect-ToGraph {
     param(
         [System.Windows.Window]$OwnerWindow,
@@ -299,7 +378,7 @@ function Connect-ToGraph {
     $clientId = if ($ClientId) { $ClientId.Trim() } else { $null }
     $useAppRegistration = (-not [string]::IsNullOrWhiteSpace($tenantId)) -and (-not [string]::IsNullOrWhiteSpace($clientId))
 
-    $context = Get-MgContext -ErrorAction SilentlyContinue
+    $context = Get-MgGraphSession
     if ($context) {
         $needsReconnect = $false
         if ($tenantId -and $context.TenantId -ne $tenantId) { $needsReconnect = $true }
@@ -314,21 +393,29 @@ function Connect-ToGraph {
         if ($useAppRegistration) {
             try { Set-MgGraphOption -EnableLoginByWAM $false -ErrorAction SilentlyContinue | Out-Null } catch {}
             try {
-                Connect-MgGraph -ClientId $clientId -TenantId $tenantId -Scopes $Scopes -NoWelcome -ErrorAction Stop
+                $context = Invoke-ConnectMgGraph -ClientId $clientId -TenantId $tenantId -Scopes $Scopes
             }
             catch {
                 $msg = $_.Exception.Message
-                if ($msg -notmatch 'window handle|InteractiveBrowserCredential|Web Account Manager|WAM|passkey') { throw }
-                $tokenResult = Get-AccessTokenViaDeviceCode -OwnerWindow $OwnerWindow -TenantId $tenantId -ClientId $clientId -Scopes $Scopes
-                Connect-MgGraph -AccessToken $tokenResult.access_token -NoWelcome -ErrorAction Stop
+                if ($msg -match 'window handle|InteractiveBrowserCredential|Web Account Manager|WAM|passkey') {
+                    try {
+                        $context = Connect-ToGraphViaBrowserHost -TenantId $tenantId -ClientId $clientId -Scopes $Scopes
+                    }
+                    catch {
+                        $tokenResult = Get-AccessTokenViaDeviceCode -OwnerWindow $OwnerWindow -TenantId $tenantId -ClientId $clientId -Scopes $Scopes
+                        Connect-MgGraph -AccessToken $tokenResult.access_token -NoWelcome -ErrorAction Stop
+                        $context = Get-MgGraphSession
+                    }
+                }
+                else { throw }
             }
         }
         else {
             try { Set-MgGraphOption -EnableLoginByWAM $false -ErrorAction SilentlyContinue | Out-Null } catch {}
             $tokenResult = Get-AccessTokenViaDeviceCode -OwnerWindow $OwnerWindow -TenantId $tenantId -ClientId $clientId -Scopes $Scopes
             Connect-MgGraph -AccessToken $tokenResult.access_token -NoWelcome -ErrorAction Stop
+            $context = Get-MgGraphSession
         }
-        $context = Get-MgContext
     }
 
     $Script:IsConnected   = $true
@@ -685,7 +772,7 @@ $xaml = @'
                   <TextBlock Text="Quick connect" FontWeight="SemiBold" FontSize="14" Margin="0,0,0,4"/>
                   <TextBlock Text="Default Graph CLI app" Foreground="{StaticResource TextMuted}" FontSize="12" Margin="0,0,0,8"/>
                   <TextBlock Foreground="{StaticResource TextMuted}" TextWrapping="Wrap" Margin="0,0,0,14" LineHeight="18" FontSize="12"
-                             Text="Built-in app. May be blocked by Conditional Access."/>
+                             Text="Uses device code - blocked when your tenant has 'Block device code flow' CA policy."/>
                   <Button x:Name="BtnConnectDefault" Content="Connect" HorizontalAlignment="Stretch"/>
                 </StackPanel>
               </Border>
@@ -705,7 +792,7 @@ $xaml = @'
                            VerticalScrollBarVisibility="Auto" Margin="0,0,0,8"/>
                   <TextBlock Foreground="{StaticResource TextMuted}" TextWrapping="Wrap"
                              FontSize="11" LineHeight="14" Margin="0,0,0,10"
-                             Text="Use only scopes granted on your app. Browser sign-in first; device code fallback if passkey/WAM fails."/>
+                             Text="Opens your browser to sign in and grant permissions (no device code). Use only scopes granted on your app."/>
                   <Button x:Name="BtnConnectApp" Content="Connect" HorizontalAlignment="Stretch"/>
                 </StackPanel>
               </Border>
