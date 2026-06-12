@@ -1,53 +1,65 @@
 # Intune Policy Explorer
 
-Graphical PowerShell tool to browse, search, and export Microsoft Intune policies via Microsoft Graph.
-
-Open-source software — contributions welcome.
+Open-source PowerShell GUI to **browse, search, and export** Microsoft Intune policies and their settings. Read-only — no policy changes.
 
 - **Repository:** https://github.com/enginsoysal/IntunePolicyExplorer
 - **License:** [MIT](LICENSE)
 
-## Install from PowerShell Gallery
+## Quick start
 
 ```powershell
 Install-Module IntunePolicyExplorer -Scope CurrentUser -Force
 Show-IntunePoliciesGUI
 ```
 
+Click **Sign in with Microsoft**. No app registration required.
+
+On first run, `Microsoft.Graph.Authentication` is installed automatically if needed.
+
+## Who is this for?
+
+Intune administrators who need to:
+
+- Discover policies across Intune policy types
+- Inspect settings per policy
+- Export documentation (JSON, CSV, HTML)
+
+No custom Entra app registration is required for typical use.
+
 ## Requirements
 
-- Windows 10/11 with PowerShell 5.1+
-- Microsoft Graph permissions (delegated) - Read **or** ReadWrite per area:
-  - `DeviceManagementConfiguration.Read.All` or `.ReadWrite.All`
-  - `DeviceManagementApps.Read.All` or `.ReadWrite.All`
-  - `DeviceManagementManagedDevices.Read.All` or `.ReadWrite.All`
-  - `Policy.Read.All` or `Policy.ReadWrite.DeviceConfiguration`
-- Account with at least **Intune Reader** role
+- Windows 10/11, PowerShell 5.1+
+- Work or school account with **Intune read access** (e.g. Intune Reader role or equivalent)
+- Microsoft Graph **delegated read** permissions (requested on first sign-in):
+  - `DeviceManagementConfiguration.Read.All`
+  - `DeviceManagementApps.Read.All`
+  - `DeviceManagementManagedDevices.Read.All`
+  - `Policy.Read.All`
 
-## Installation
+## Sign-in
 
-```powershell
-Install-Module Microsoft.Graph.Authentication -Scope CurrentUser
-```
+### Default (recommended)
 
-## Usage
+**Sign in with Microsoft** uses the built-in Microsoft Graph sign-in flow:
 
-```powershell
-.\Show-IntunePoliciesGUI.ps1
-```
+1. Browser or sign-in window opens
+2. Sign in with your work account
+3. Approve read permissions (admin consent may already exist in your tenant)
+4. Policies load automatically
 
-### Tabs
+### Advanced options (optional)
 
-| Tab | Function |
-|-----|----------|
-| **Connection** | Sign in to Microsoft Graph |
-| **Policies** | Overview of all policy types, search and filter |
-| **Settings** | Detailed settings per selected policy |
-| **Export** | JSON, CSV, or HTML report |
+Only needed when default sign-in is blocked by **Conditional Access** (e.g. device code flow blocked).
 
-### Supported policy types
+Expand **Advanced options** and provide your own Entra app:
 
-- Configuration Profiles (legacy)
+- Tenant ID
+- Client ID
+- Scopes (optional — leave empty for recommended Intune read scopes)
+
+## Supported policy types
+
+- Configuration Profiles
 - Settings Catalog
 - Compliance policies
 - Administrative Templates (ADMX)
@@ -56,22 +68,36 @@ Install-Module Microsoft.Graph.Authentication -Scope CurrentUser
 - App Protection (iOS / Android / Windows)
 - Mobile App Configurations
 
-### Sign-in
+Unavailable types are skipped with a warning (depends on your permissions).
 
-**Default:** Device code dialog (built into the app). No PowerShell console required.
+## Export
 
-**App registration** (Connection tab): Uses `Connect-MgGraph -TenantId -ClientId` with browser sign-in (same as in PowerShell). No client secret. Use when the default Graph CLI app is blocked by Conditional Access.
+| Format | Contents |
+|--------|----------|
+| **JSON** | Full policy + settings + raw Graph object |
+| **CSV** | Policy overview + separate settings CSV |
+| **HTML** | Readable audit/documentation report |
 
-**App registration setup:** Add delegated Graph permissions and grant admin consent on your Entra app registration. Use the **Scopes** field to match the permissions on your Entra app (one scope per line).
+Export selected policies or all loaded policies.
 
-## Export formats
+## Troubleshooting
 
-- **JSON** – Full data including raw Graph object
-- **CSV** – Overview + separate settings file
-- **HTML** – Readable report for documentation/audit
+| Issue | What to try |
+|-------|-------------|
+| Device code blocked by CA | Use **Advanced options** with your own Entra app |
+| Invalid scope error | Update module: `Update-Module IntunePolicyExplorer -Force` |
+| Empty policy list | Verify Intune Reader role and Graph read permissions |
+| Sign-in window closes | Update Graph module: `Update-Module Microsoft.Graph.Authentication -Force` |
+
+## Development
+
+```powershell
+git clone https://github.com/enginsoysal/IntunePolicyExplorer.git
+.\Show-IntunePoliciesGUI.ps1
+```
+
+Publish to Gallery: `.\Publish-ToGallery.ps1 -ApiKey '<your-key>'`
 
 ## License
 
-MIT License — see [LICENSE](LICENSE).
-
-Copyright (c) 2026 Engin Soysal
+MIT License — Copyright (c) 2026 Engin Soysal. See [LICENSE](LICENSE).

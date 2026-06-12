@@ -1,6 +1,6 @@
 @{
     RootModule        = 'IntunePolicyExplorer.psm1'
-    ModuleVersion     = '1.1.3'
+    ModuleVersion     = '1.2.0'
     GUID              = 'a8f3c2e1-9b4d-4a6f-8e2c-1d5b7f9a3e6c'
     Author            = 'Engin Soysal'
     CompanyName       = 'ProSysTech'
@@ -20,7 +20,7 @@
             Tags         = @('Intune', 'MicrosoftGraph', 'Policy', 'GUI', 'DeviceManagement', 'EndpointManager', 'Export', 'OpenSource')
             LicenseUri   = 'https://github.com/enginsoysal/IntunePolicyExplorer/blob/main/LICENSE'
             ProjectUri   = 'https://github.com/enginsoysal/IntunePolicyExplorer'
-            ReleaseNotes = '1.1.3: Fix Quick connect - remove invalid Policy.ReadWrite.All scope; use minimal Read scopes for Graph CLI app.'
+            ReleaseNotes = '1.2.0: Universal sign-in redesign - one-click Microsoft sign-in, optional advanced app registration, improved browser auth cascade.'
             Prerelease   = ''
         }
     }

@@ -21,6 +21,7 @@ $ErrorActionPreference = 'Stop'
 # Graph PowerShell built-in public client ID
 $Script:GraphClientId = '14d82eec-204b-4c2f-b7e8-296a70dab67e'
 
+# Valid Graph delegated scopes for session detection (Policy.ReadWrite.All does not exist on Graph)
 $Script:GraphApiScopes = @(
     'DeviceManagementConfiguration.Read.All'
     'DeviceManagementConfiguration.ReadWrite.All'
@@ -29,10 +30,17 @@ $Script:GraphApiScopes = @(
     'DeviceManagementManagedDevices.Read.All'
     'DeviceManagementManagedDevices.ReadWrite.All'
     'Policy.Read.All'
-    'Policy.ReadWrite.All'
     'Policy.ReadWrite.DeviceConfiguration'
 )
-$Script:GraphScopes = $Script:GraphApiScopes + @('offline_access', 'openid', 'profile')
+
+# Quick connect: minimal Read scopes for the built-in Graph CLI app
+$Script:QuickConnectApiScopes = @(
+    'DeviceManagementConfiguration.Read.All'
+    'DeviceManagementApps.Read.All'
+    'DeviceManagementManagedDevices.Read.All'
+    'Policy.Read.All'
+)
+$Script:QuickConnectScopes = $Script:QuickConnectApiScopes + @('offline_access', 'openid', 'profile')
 
 # Typical delegated scopes for a custom Intune app (ReadWrite, no Policy.Read.All)
 $Script:DefaultAppRegistrationScopes = @(
@@ -57,7 +65,7 @@ function Resolve-GraphScopes {
         $Script:DefaultAppRegistrationScopes
     }
     else {
-        $Script:GraphApiScopes
+        $Script:QuickConnectApiScopes
     }
 
     foreach ($oauth in @('offline_access', 'openid', 'profile')) {
@@ -133,21 +141,32 @@ function Test-GraphModule {
 }
 
 function Install-GraphModuleIfNeeded {
-    if (Test-GraphModule) { return $true }
-    $answer = [System.Windows.MessageBox]::Show(
-        "The module 'Microsoft.Graph.Authentication' is not installed.`n`nInstall it now (CurrentUser)?",
-        'Module required',
-        [System.Windows.MessageBoxButton]::YesNo,
-        [System.Windows.MessageBoxImage]::Question)
-    if ($answer -ne [System.Windows.MessageBoxResult]::Yes) { return $false }
+    if (-not (Test-GraphModule)) {
+        $answer = [System.Windows.MessageBox]::Show(
+            "Microsoft Graph Authentication is required for sign-in.`n`nInstall it now (CurrentUser)?",
+            'Module required',
+            [System.Windows.MessageBoxButton]::YesNo,
+            [System.Windows.MessageBoxImage]::Question)
+        if ($answer -ne [System.Windows.MessageBoxResult]::Yes) { return $false }
+        try {
+            Install-Module Microsoft.Graph.Authentication -Scope CurrentUser -Force -AllowClobber
+        }
+        catch {
+            [System.Windows.MessageBox]::Show("Installation failed: $($_.Exception.Message)", 'Error', 'OK', 'Error') | Out-Null
+            return $false
+        }
+    }
     try {
-        Install-Module Microsoft.Graph.Authentication -Scope CurrentUser -Force -AllowClobber
-        return $true
+        Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
+        if (-not (Test-MgCommandSupportsContextScope -CommandName 'Connect-MgGraph')) {
+            Update-Module Microsoft.Graph.Authentication -Scope CurrentUser -Force -ErrorAction Stop
+            Import-Module Microsoft.Graph.Authentication -Force -ErrorAction Stop
+        }
     }
     catch {
-        [System.Windows.MessageBox]::Show("Installation failed: $($_.Exception.Message)", 'Error', 'OK', 'Error') | Out-Null
-        return $false
+        Write-Warning 'Could not update Microsoft.Graph.Authentication. Sign-in may use device code fallback.'
     }
+    return $true
 }
 
 function Show-DeviceCodeDialog {
@@ -176,7 +195,7 @@ function Show-DeviceCodeDialog {
       <TextBlock Grid.Row="0" Text="Device code sign-in" FontSize="15" FontWeight="SemiBold" Margin="0,0,0,4"/>
       <TextBlock Grid.Row="1" x:Name="TxtClientLabel" Foreground="#64748B" FontSize="11" TextWrapping="Wrap" Margin="0,0,0,2"/>
       <TextBlock Grid.Row="2" x:Name="TxtCaWarning" Visibility="Collapsed" Foreground="#9A3412" TextWrapping="Wrap"
-                 FontSize="10" Margin="0,0,0,6" Text="Default app blocked? Try App registration with your own Entra app."/>
+                 FontSize="10" Margin="0,0,0,6" Text="Device code blocked? Expand Advanced options on the Connection tab and use your own Entra app."/>
 
       <Grid Grid.Row="3" Margin="0,4,0,10">
         <Grid.ColumnDefinitions>
@@ -259,7 +278,7 @@ function Get-AccessTokenViaDeviceCode {
         [System.Windows.Window]$OwnerWindow,
         [string]$TenantId,
         [string]$ClientId,
-        [string[]]$Scopes = $Script:GraphScopes
+        [string[]]$Scopes = $Script:QuickConnectScopes
     )
 
     $clientId    = if ([string]::IsNullOrWhiteSpace($ClientId)) { $Script:GraphClientId } else { $ClientId.Trim() }
@@ -323,28 +342,33 @@ function Get-AccessTokenViaDeviceCode {
     }
 }
 
-function Connect-ToGraphViaBrowserHost {
+function Invoke-MgGraphBrowserHost {
     param(
         [string]$TenantId,
         [string]$ClientId,
         [string[]]$Scopes
     )
 
-    $escapedClient = $ClientId.Replace("'", "''")
-    $escapedTenant = $TenantId.Replace("'", "''")
-    $scopeArray    = ($Scopes | ForEach-Object { "'$($_.Replace("'", "''"))'" }) -join ', '
-
     if (-not (Test-MgCommandSupportsContextScope -CommandName 'Connect-MgGraph')) {
         throw [System.InvalidOperationException]::new(
-            'Browser sign-in fallback requires a newer Microsoft.Graph.Authentication module.`n`n' +
+            'Sign-in window requires Microsoft.Graph.Authentication 2.16 or newer.`n`n' +
             'Run: Update-Module Microsoft.Graph.Authentication -Scope CurrentUser -Force')
+    }
+
+    $scopeArray = ($Scopes | ForEach-Object { "'$($_.Replace("'", "''"))'" }) -join ', '
+    $connectArgs = @("-Scopes @($scopeArray)", '-NoWelcome', '-ContextScope CurrentUser')
+    if (-not [string]::IsNullOrWhiteSpace($ClientId)) {
+        $connectArgs = @("-ClientId '$($ClientId.Trim().Replace("'", "''"))'") + $connectArgs
+    }
+    if (-not [string]::IsNullOrWhiteSpace($TenantId)) {
+        $connectArgs = @("-TenantId '$($TenantId.Trim().Replace("'", "''"))'") + $connectArgs
     }
 
     $connectScript = @"
 `$ErrorActionPreference = 'Stop'
 Import-Module Microsoft.Graph.Authentication
 Set-MgGraphOption -EnableLoginByWAM `$false | Out-Null
-Connect-MgGraph -ClientId '$escapedClient' -TenantId '$escapedTenant' -Scopes @($scopeArray) -ContextScope CurrentUser -NoWelcome
+Connect-MgGraph $($connectArgs -join ' ')
 "@
 
     $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($connectScript))
@@ -356,27 +380,28 @@ Connect-MgGraph -ClientId '$escapedClient' -TenantId '$escapedTenant' -Scopes @(
     $context = Get-MgGraphSession
     if (-not $context) {
         throw [System.InvalidOperationException]::new(
-            'Browser sign-in did not complete. Sign in via the opened PowerShell window, approve permissions, and try again.')
+            'Sign-in did not complete. Finish sign-in in the browser, approve permissions, and try again.')
     }
     if ($proc.ExitCode -and $proc.ExitCode -ne 0) {
-        throw [System.InvalidOperationException]::new('Browser sign-in was cancelled or failed.')
+        throw [System.InvalidOperationException]::new('Sign-in was cancelled or failed.')
     }
     return $context
 }
 
-function Connect-ToGraph {
+function Connect-ToGraphUniversal {
     param(
         [System.Windows.Window]$OwnerWindow,
         [string]$TenantId,
         [string]$ClientId,
-        [string[]]$Scopes = $Script:GraphScopes
+        [string[]]$Scopes = $Script:QuickConnectScopes
     )
 
     Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
+    try { Set-MgGraphOption -EnableLoginByWAM $false -ErrorAction SilentlyContinue | Out-Null } catch {}
 
     $tenantId = if ($TenantId) { $TenantId.Trim() } else { $null }
     $clientId = if ($ClientId) { $ClientId.Trim() } else { $null }
-    $useAppRegistration = (-not [string]::IsNullOrWhiteSpace($tenantId)) -and (-not [string]::IsNullOrWhiteSpace($clientId))
+    $hasCustomApp = (-not [string]::IsNullOrWhiteSpace($tenantId)) -and (-not [string]::IsNullOrWhiteSpace($clientId))
 
     $context = Get-MgGraphSession
     if ($context) {
@@ -389,38 +414,61 @@ function Connect-ToGraph {
         }
     }
 
-    if (-not $context) {
-        if ($useAppRegistration) {
-            try { Set-MgGraphOption -EnableLoginByWAM $false -ErrorAction SilentlyContinue | Out-Null } catch {}
-            try {
-                $context = Invoke-ConnectMgGraph -ClientId $clientId -TenantId $tenantId -Scopes $Scopes
-            }
-            catch {
-                $msg = $_.Exception.Message
-                if ($msg -match 'window handle|InteractiveBrowserCredential|Web Account Manager|WAM|passkey') {
-                    try {
-                        $context = Connect-ToGraphViaBrowserHost -TenantId $tenantId -ClientId $clientId -Scopes $Scopes
-                    }
-                    catch {
-                        $tokenResult = Get-AccessTokenViaDeviceCode -OwnerWindow $OwnerWindow -TenantId $tenantId -ClientId $clientId -Scopes $Scopes
-                        Connect-MgGraph -AccessToken $tokenResult.access_token -NoWelcome -ErrorAction Stop
-                        $context = Get-MgGraphSession
-                    }
-                }
-                else { throw }
-            }
-        }
-        else {
-            try { Set-MgGraphOption -EnableLoginByWAM $false -ErrorAction SilentlyContinue | Out-Null } catch {}
-            $tokenResult = Get-AccessTokenViaDeviceCode -OwnerWindow $OwnerWindow -TenantId $tenantId -ClientId $clientId -Scopes $Scopes
-            Connect-MgGraph -AccessToken $tokenResult.access_token -NoWelcome -ErrorAction Stop
-            $context = Get-MgGraphSession
-        }
+    if ($context) {
+        $Script:IsConnected   = $true
+        $Script:CurrentTenant = $context.TenantId
+        return $context
     }
 
-    $Script:IsConnected   = $true
-    $Script:CurrentTenant = $context.TenantId
-    return $context
+    $errors = [System.Collections.Generic.List[string]]::new()
+
+    try {
+        if ($hasCustomApp) {
+            return Invoke-ConnectMgGraph -ClientId $clientId -TenantId $tenantId -Scopes $Scopes
+        }
+        return Invoke-ConnectMgGraph -Scopes $Scopes
+    }
+    catch {
+        $errors.Add("In-app browser: $($_.Exception.Message)")
+    }
+
+    try {
+        [void][System.Windows.MessageBox]::Show(
+            "A short-lived PowerShell window will open for Microsoft sign-in.`n`n" +
+            'Sign in with your work account in the browser, approve read permissions, then return here.',
+            'Sign in with Microsoft', 'OK', 'Information')
+        $ctx = Invoke-MgGraphBrowserHost -TenantId $tenantId -ClientId $clientId -Scopes $Scopes
+        $Script:IsConnected   = $true
+        $Script:CurrentTenant = $ctx.TenantId
+        return $ctx
+    }
+    catch {
+        $errors.Add("Sign-in window: $($_.Exception.Message)")
+    }
+
+    try {
+        $tokenResult = Get-AccessTokenViaDeviceCode -OwnerWindow $OwnerWindow -TenantId $tenantId -ClientId $clientId -Scopes $Scopes
+        Connect-MgGraph -AccessToken $tokenResult.access_token -NoWelcome -ErrorAction Stop
+        $ctx = Get-MgGraphSession
+        if ($ctx) {
+            $Script:IsConnected   = $true
+            $Script:CurrentTenant = $ctx.TenantId
+            return $ctx
+        }
+    }
+    catch {
+        $errors.Add("Device code: $($_.Exception.Message)")
+    }
+
+    $hint = if ($hasCustomApp) {
+        'Verify Tenant ID, Client ID, and scopes on your Entra app registration.'
+    }
+    else {
+        'If your organization blocks device code (Conditional Access), open Advanced options and connect with your own Entra app.'
+    }
+
+    throw [System.InvalidOperationException]::new(
+        "Could not sign in to Microsoft Graph.`n`n$($errors -join "`n`n")`n`n$hint")
 }
 
 function Invoke-GraphPaged {
@@ -755,48 +803,34 @@ $xaml = @'
               <RowDefinition Height="Auto"/>
             </Grid.RowDefinitions>
 
-            <TextBlock Grid.Row="0" Text="Microsoft Graph connection" FontSize="18" FontWeight="SemiBold" Margin="0,0,0,6"/>
+            <TextBlock Grid.Row="0" Text="Sign in" FontSize="18" FontWeight="SemiBold" Margin="0,0,0,6"/>
             <TextBlock Grid.Row="1" Foreground="{StaticResource TextMuted}" TextWrapping="Wrap" Margin="0,0,0,14" LineHeight="20"
-                       Text="Sign in with an account that can read Intune policies. Permissions: DeviceManagementConfiguration.Read.All or .ReadWrite.All (and related Intune read scopes)."/>
+                       Text="Browse and export Intune policies with read-only access. No app registration required - use your work account. You need Intune read permissions (admin consent may apply on first sign-in)."/>
 
-            <Grid Grid.Row="2" Margin="0,0,0,14">
-              <Grid.ColumnDefinitions>
-                <ColumnDefinition Width="*"/>
-                <ColumnDefinition Width="12"/>
-                <ColumnDefinition Width="*"/>
-              </Grid.ColumnDefinitions>
-
-              <Border Grid.Column="0" Background="#F8FAFC"
-                      BorderBrush="{StaticResource Border}" BorderThickness="1" CornerRadius="8" Padding="14" VerticalAlignment="Top">
-                <StackPanel>
-                  <TextBlock Text="Quick connect" FontWeight="SemiBold" FontSize="14" Margin="0,0,0,4"/>
-                  <TextBlock Text="Default Graph CLI app" Foreground="{StaticResource TextMuted}" FontSize="12" Margin="0,0,0,8"/>
-                  <TextBlock Foreground="{StaticResource TextMuted}" TextWrapping="Wrap" Margin="0,0,0,14" LineHeight="18" FontSize="12"
-                             Text="Uses device code - blocked when your tenant has 'Block device code flow' CA policy."/>
-                  <Button x:Name="BtnConnectDefault" Content="Connect" HorizontalAlignment="Stretch"/>
-                </StackPanel>
-              </Border>
-
-              <Border Grid.Column="2" Background="#F8FAFC" BorderBrush="{StaticResource Border}" BorderThickness="1"
-                      CornerRadius="8" Padding="14" VerticalAlignment="Top">
-                <StackPanel>
-                  <TextBlock Text="App registration" FontWeight="SemiBold" FontSize="14" Margin="0,0,0,4"/>
-                  <TextBlock Foreground="{StaticResource TextMuted}" FontSize="12" Margin="0,0,0,8"
-                             Text="Your own Entra app (recommended)"/>
-                  <TextBlock Text="Tenant ID" FontWeight="SemiBold" FontSize="12" Margin="0,0,0,3"/>
-                  <TextBox x:Name="TxtTenantId" Margin="0,0,0,8" FontSize="12"/>
-                  <TextBlock Text="Client ID" FontWeight="SemiBold" FontSize="12" Margin="0,0,0,3"/>
-                  <TextBox x:Name="TxtClientId" Margin="0,0,0,8" FontSize="12"/>
-                  <TextBlock Text="Scopes (one per line)" FontWeight="SemiBold" FontSize="12" Margin="0,0,0,3"/>
-                  <TextBox x:Name="TxtScopes" Height="78" FontSize="11" TextWrapping="Wrap" AcceptsReturn="True"
-                           VerticalScrollBarVisibility="Auto" Margin="0,0,0,8"/>
-                  <TextBlock Foreground="{StaticResource TextMuted}" TextWrapping="Wrap"
-                             FontSize="11" LineHeight="14" Margin="0,0,0,10"
-                             Text="Opens your browser to sign in and grant permissions (no device code). Use only scopes granted on your app."/>
-                  <Button x:Name="BtnConnectApp" Content="Connect" HorizontalAlignment="Stretch"/>
-                </StackPanel>
-              </Border>
-            </Grid>
+            <Border Grid.Row="2" Background="#F8FAFC" BorderBrush="{StaticResource Border}" BorderThickness="1"
+                    CornerRadius="8" Padding="20" Margin="0,0,0,14">
+              <StackPanel>
+                <Button x:Name="BtnConnect" Content="Sign in with Microsoft" Height="40" FontSize="14"
+                        HorizontalAlignment="Left" MinWidth="240" Margin="0,0,0,12"/>
+                <TextBlock Foreground="{StaticResource TextMuted}" TextWrapping="Wrap" FontSize="11" LineHeight="15" Margin="0,0,0,8"
+                           Text="Uses the built-in Microsoft Graph sign-in. Works for most tenants with minimal setup."/>
+                <Expander x:Name="ExpAdvanced" Header="Advanced options (optional)" IsExpanded="False">
+                  <StackPanel Margin="0,10,0,0">
+                    <TextBlock Foreground="{StaticResource TextMuted}" TextWrapping="Wrap" FontSize="11" LineHeight="15" Margin="0,0,0,10"
+                               Text="Only if default sign-in is blocked by Conditional Access. Use your own Entra app registration - not required for most users."/>
+                    <TextBlock Text="Tenant ID" FontWeight="SemiBold" FontSize="12" Margin="0,0,0,3"/>
+                    <TextBox x:Name="TxtTenantId" Margin="0,0,0,8" FontSize="12"/>
+                    <TextBlock Text="Client ID" FontWeight="SemiBold" FontSize="12" Margin="0,0,0,3"/>
+                    <TextBox x:Name="TxtClientId" Margin="0,0,0,8" FontSize="12"/>
+                    <TextBlock Text="Scopes (optional, one per line)" FontWeight="SemiBold" FontSize="12" Margin="0,0,0,3"/>
+                    <TextBox x:Name="TxtScopes" Height="72" FontSize="11" TextWrapping="Wrap" AcceptsReturn="True"
+                             VerticalScrollBarVisibility="Auto" Margin="0,0,0,10"/>
+                    <Button x:Name="BtnConnectAdvanced" Content="Connect with app registration"
+                            HorizontalAlignment="Left" MinWidth="240"/>
+                  </StackPanel>
+                </Expander>
+              </StackPanel>
+            </Border>
 
             <StackPanel Grid.Row="3" Margin="0,0,0,4">
               <Button x:Name="BtnDisconnect" Content="Disconnect" Style="{StaticResource SecondaryButton}"
@@ -938,8 +972,8 @@ $reader = [System.Xml.XmlReader]::Create([System.IO.StringReader]::new($xaml))
 $window = [Windows.Markup.XamlReader]::Load($reader)
 $Script:OwnerWindow = $window
 
-$btnConnectDefault  = $window.FindName('BtnConnectDefault')
-$btnConnectApp      = $window.FindName('BtnConnectApp')
+$btnConnect         = $window.FindName('BtnConnect')
+$btnConnectAdvanced = $window.FindName('BtnConnectAdvanced')
 $btnDisconnect      = $window.FindName('BtnDisconnect')
 $btnRefresh         = $window.FindName('BtnRefresh')
 $btnLoadDetails     = $window.FindName('BtnLoadDetails')
@@ -980,10 +1014,10 @@ $txtSearch.Foreground = '#94A3B8'
 
 $txtTenantId.Text = ''
 $txtClientId.Text = ''
-$txtScopes.Text = ($Script:DefaultAppRegistrationScopes -join "`n")
-$txtTenantId.ToolTip = 'e.g. xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'
-$txtClientId.ToolTip = 'Application (client) ID from your Entra app registration'
-$txtScopes.ToolTip = 'Delegated Graph scopes from your app registration API permissions (one per line)'
+$txtScopes.Text = ''
+$txtTenantId.ToolTip = 'Only for Advanced sign-in: your Entra directory (tenant) ID'
+$txtClientId.ToolTip = 'Only for Advanced sign-in: application (client) ID from your Entra app'
+$txtScopes.ToolTip = 'Optional. Leave empty for recommended Intune read scopes. One Graph scope per line.'
 
 $Script:FilteredView = [System.Windows.Data.CollectionViewSource]::GetDefaultView($Script:AllPolicies)
 $Script:FilteredView.Filter = {
@@ -1006,8 +1040,8 @@ function Set-ConnectedUI([bool]$Connected, $Context = $null) {
             $txtConnectionStatus.Text = 'Connected'
             $txtSubtitle.Text = "Tenant: $($Context.TenantId)"
             $txtTenantInfo.Text = "Client ID: $($Context.ClientId)`nAccount: $($Context.Account)`nTenant ID: $($Context.TenantId)`nScopes: $($Context.Scopes -join ', ')"
-            $btnConnectDefault.IsEnabled = $false
-            $btnConnectApp.IsEnabled = $false
+            $btnConnect.IsEnabled = $false
+            $btnConnectAdvanced.IsEnabled = $false
             $btnDisconnect.IsEnabled = $true
             $btnRefresh.IsEnabled = $true
             $btnExport.IsEnabled = $true
@@ -1017,8 +1051,8 @@ function Set-ConnectedUI([bool]$Connected, $Context = $null) {
             $txtConnectionStatus.Text = 'Not connected'
             $txtSubtitle.Text = 'Connect to Microsoft Graph to load policies'
             $txtTenantInfo.Text = 'Not connected yet.'
-            $btnConnectDefault.IsEnabled = $true
-            $btnConnectApp.IsEnabled = $true
+            $btnConnect.IsEnabled = $true
+            $btnConnectAdvanced.IsEnabled = $true
             $btnDisconnect.IsEnabled = $false
             $btnRefresh.IsEnabled = $false
             $btnExport.IsEnabled = $false
@@ -1068,26 +1102,24 @@ function Show-PolicyDetails($Item) {
 }
 
 function Invoke-GraphConnect {
-    param(
-        [bool]$UseAppRegistration
-    )
+    param([switch]$UseAdvanced)
     try {
         Set-Status 'Connecting...'
-        $btnConnectDefault.IsEnabled = $false
-        $btnConnectApp.IsEnabled = $false
+        $btnConnect.IsEnabled = $false
+        $btnConnectAdvanced.IsEnabled = $false
 
-        if ($UseAppRegistration) {
+        if ($UseAdvanced) {
             if ([string]::IsNullOrWhiteSpace($txtClientId.Text)) {
-                throw [System.InvalidOperationException]::new('Client ID is required for app registration sign-in.')
+                throw [System.InvalidOperationException]::new('Client ID is required for advanced sign-in.')
             }
             if ([string]::IsNullOrWhiteSpace($txtTenantId.Text)) {
-                throw [System.InvalidOperationException]::new('Tenant ID is required for app registration sign-in.')
+                throw [System.InvalidOperationException]::new('Tenant ID is required for advanced sign-in.')
             }
             $scopes = Resolve-GraphScopes -CustomScopesText $txtScopes.Text -UseAppRegistration
-            $ctx = Connect-ToGraph -OwnerWindow $window -TenantId $txtTenantId.Text -ClientId $txtClientId.Text -Scopes $scopes
+            $ctx = Connect-ToGraphUniversal -OwnerWindow $window -TenantId $txtTenantId.Text -ClientId $txtClientId.Text -Scopes $scopes
         }
         else {
-            $ctx = Connect-ToGraph -OwnerWindow $window
+            $ctx = Connect-ToGraphUniversal -OwnerWindow $window -Scopes $Script:QuickConnectScopes
         }
 
         Set-ConnectedUI -Connected $true -Context $ctx
@@ -1100,8 +1132,8 @@ function Invoke-GraphConnect {
     }
 }
 
-$btnConnectDefault.Add_Click({ Invoke-GraphConnect -UseAppRegistration $false })
-$btnConnectApp.Add_Click({ Invoke-GraphConnect -UseAppRegistration $true })
+$btnConnect.Add_Click({ Invoke-GraphConnect })
+$btnConnectAdvanced.Add_Click({ Invoke-GraphConnect -UseAdvanced })
 
 $btnDisconnect.Add_Click({
     try { Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null } catch {}
@@ -1181,7 +1213,7 @@ try {
 } catch {}
 
 try {
-    $existing = Get-MgContext -ErrorAction SilentlyContinue
+    $existing = Get-MgGraphSession
     if (Test-HasIntuneGraphSession -Context $existing) {
         $Script:IsConnected   = $true
         $Script:CurrentTenant = $existing.TenantId
