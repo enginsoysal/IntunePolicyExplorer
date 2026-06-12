@@ -270,7 +270,46 @@ function Show-DeviceCodeDialog {
 }
 
 function Invoke-UiPump {
+    if ($Script:OwnerWindow) {
+        try {
+            [void]$Script:OwnerWindow.Dispatcher.Invoke(
+                [action]{},
+                [System.Windows.Threading.DispatcherPriority]::Background)
+        }
+        catch { }
+    }
     [System.Windows.Forms.Application]::DoEvents()
+}
+
+function Wait-ProcessWithUiPump {
+    param([System.Diagnostics.Process]$Process)
+    while (-not $Process.HasExited) {
+        Invoke-UiPump
+        Start-Sleep -Milliseconds 150
+    }
+}
+
+function Invoke-OnUiThread {
+    param([scriptblock]$Action)
+    if ($window.Dispatcher.CheckAccess()) {
+        & $Action
+    }
+    else {
+        $window.Dispatcher.Invoke($Action)
+    }
+}
+
+function Close-DeviceCodeDialog {
+    param($Dialog)
+    if (-not $Dialog) { return }
+    try {
+        if ($Dialog.Dispatcher) {
+            if ($Dialog.Dispatcher.CheckAccess()) { $Dialog.Close() }
+            else { $Dialog.Dispatcher.Invoke([action]{ $Dialog.Close() }) }
+        }
+        else { $Dialog.Close() }
+    }
+    catch { }
 }
 
 function Get-AccessTokenViaDeviceCode {
@@ -309,13 +348,15 @@ function Get-AccessTokenViaDeviceCode {
 
             try {
                 $tokenResult = Invoke-RestMethod -Method POST -Uri $tokenUri -Body $tokenBody -ContentType 'application/x-www-form-urlencoded'
-                $dialog.Dispatcher.Invoke([action]{ $dialog.Close() })
+                Close-DeviceCodeDialog -Dialog $dialog
                 return $tokenResult
             }
             catch {
                 $err = $_.ErrorDetails.Message | ConvertFrom-Json -ErrorAction SilentlyContinue
                 if ($err.error -eq 'authorization_pending') {
-                    $dialog.Dispatcher.Invoke([action]{ $dialog.FindName('TxtStatus').Text = 'Waiting for sign-in...' })
+                    if ($dialog.Dispatcher) {
+                        $dialog.Dispatcher.Invoke([action]{ $dialog.FindName('TxtStatus').Text = 'Waiting for sign-in...' })
+                    }
                     continue
                 }
                 if ($err.error -eq 'slow_down') {
@@ -336,9 +377,7 @@ function Get-AccessTokenViaDeviceCode {
             "Complete sign-in in the browser before the code expires, or try App registration with your own Entra app.")
     }
     finally {
-        if ($dialog.Dispatcher.Invoke([func[bool]]{ $dialog.IsVisible })) {
-            $dialog.Dispatcher.Invoke([action]{ $dialog.Close() })
-        }
+        Close-DeviceCodeDialog -Dialog $dialog
     }
 }
 
@@ -374,7 +413,8 @@ Connect-MgGraph $($connectArgs -join ' ')
     $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($connectScript))
     $proc = Start-Process -FilePath 'powershell.exe' `
         -ArgumentList "-NoProfile -STA -EncodedCommand $encoded" `
-        -PassThru -Wait -WindowStyle Normal
+        -PassThru -WindowStyle Normal
+    Wait-ProcessWithUiPump -Process $proc
 
     Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
     $context = Get-MgGraphSession
@@ -1030,11 +1070,11 @@ $Script:FilteredView.Filter = {
 }
 
 function Set-Status([string]$Message) {
-    $txtStatus.Dispatcher.Invoke([action]{ $txtStatus.Text = $Message })
+    Invoke-OnUiThread { $txtStatus.Text = $Message }
 }
 
 function Set-ConnectedUI([bool]$Connected, $Context = $null) {
-    $window.Dispatcher.Invoke([action]{
+    Invoke-OnUiThread {
         if ($Connected) {
             $statusDot.Fill = '#86EFAC'
             $txtConnectionStatus.Text = 'Connected'
@@ -1064,7 +1104,7 @@ function Set-ConnectedUI([bool]$Connected, $Context = $null) {
 function Load-PoliciesAsync {
     Set-Status 'Loading policies from Microsoft Graph...'
     $btnRefresh.IsEnabled = $false
-    [System.Windows.Application]::Current.Dispatcher.InvokeAsync({
+    $window.Dispatcher.InvokeAsync({
         try {
             $Script:AllPolicies.Clear()
             $list = Get-AllIntunePolicies
