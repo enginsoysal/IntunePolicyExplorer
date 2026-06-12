@@ -1,6 +1,6 @@
 @{
     RootModule        = 'IntunePolicyExplorer.psm1'
-    ModuleVersion     = '1.2.1'
+    ModuleVersion     = '1.2.2'
     GUID              = 'a8f3c2e1-9b4d-4a6f-8e2c-1d5b7f9a3e6c'
     Author            = 'Engin Soysal'
     CompanyName       = 'ProSysTech'
@@ -20,7 +20,7 @@
             Tags         = @('Intune', 'MicrosoftGraph', 'Policy', 'GUI', 'DeviceManagement', 'EndpointManager', 'Export', 'OpenSource')
             LicenseUri   = 'https://github.com/enginsoysal/IntunePolicyExplorer/blob/main/LICENSE'
             ProjectUri   = 'https://github.com/enginsoysal/IntunePolicyExplorer'
-            ReleaseNotes = '1.2.1: Fix UI Dispatcher error after browser sign-in. 1.2.0: Universal one-click sign-in with optional advanced app registration.'
+            ReleaseNotes = '1.2.2: Fix syntax error preventing startup. 1.2.1: Fix Dispatcher error after browser sign-in.'
             Prerelease   = ''
         }
     }

@@ -1098,7 +1098,7 @@ function Set-ConnectedUI([bool]$Connected, $Context = $null) {
             $btnExport.IsEnabled = $false
             $btnLoadDetails.IsEnabled = $false
         }
-    })
+    }
 }
 
 function Load-PoliciesAsync {
