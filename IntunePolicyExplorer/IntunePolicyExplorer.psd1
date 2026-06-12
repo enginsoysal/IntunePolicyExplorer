@@ -1,6 +1,6 @@
 @{
     RootModule        = 'IntunePolicyExplorer.psm1'
-    ModuleVersion     = '1.1.2'
+    ModuleVersion     = '1.1.3'
     GUID              = 'a8f3c2e1-9b4d-4a6f-8e2c-1d5b7f9a3e6c'
     Author            = 'Engin Soysal'
     CompanyName       = 'ProSysTech'
@@ -20,7 +20,7 @@
             Tags         = @('Intune', 'MicrosoftGraph', 'Policy', 'GUI', 'DeviceManagement', 'EndpointManager', 'Export', 'OpenSource')
             LicenseUri   = 'https://github.com/enginsoysal/IntunePolicyExplorer/blob/main/LICENSE'
             ProjectUri   = 'https://github.com/enginsoysal/IntunePolicyExplorer'
-            ReleaseNotes = '1.1.2: Fix ContextScope error on older Graph modules; Quick connect device code restored.'
+            ReleaseNotes = '1.1.3: Fix Quick connect - remove invalid Policy.ReadWrite.All scope; use minimal Read scopes for Graph CLI app.'
             Prerelease   = ''
         }
     }

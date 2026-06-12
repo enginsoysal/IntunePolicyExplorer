@@ -21,7 +21,7 @@ Show-IntunePoliciesGUI
   - `DeviceManagementConfiguration.Read.All` or `.ReadWrite.All`
   - `DeviceManagementApps.Read.All` or `.ReadWrite.All`
   - `DeviceManagementManagedDevices.Read.All` or `.ReadWrite.All`
-  - `Policy.Read.All` or `.ReadWrite.All`
+  - `Policy.Read.All` or `Policy.ReadWrite.DeviceConfiguration`
 - Account with at least **Intune Reader** role
 
 ## Installation

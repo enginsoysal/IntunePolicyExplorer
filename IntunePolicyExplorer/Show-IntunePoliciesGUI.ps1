@@ -21,6 +21,7 @@ $ErrorActionPreference = 'Stop'
 # Graph PowerShell built-in public client ID
 $Script:GraphClientId = '14d82eec-204b-4c2f-b7e8-296a70dab67e'
 
+# Valid Graph delegated scopes for session detection (Policy.ReadWrite.All does not exist on Graph)
 $Script:GraphApiScopes = @(
     'DeviceManagementConfiguration.Read.All'
     'DeviceManagementConfiguration.ReadWrite.All'
@@ -29,10 +30,17 @@ $Script:GraphApiScopes = @(
     'DeviceManagementManagedDevices.Read.All'
     'DeviceManagementManagedDevices.ReadWrite.All'
     'Policy.Read.All'
-    'Policy.ReadWrite.All'
     'Policy.ReadWrite.DeviceConfiguration'
 )
-$Script:GraphScopes = $Script:GraphApiScopes + @('offline_access', 'openid', 'profile')
+
+# Quick connect: minimal Read scopes for the built-in Graph CLI app
+$Script:QuickConnectApiScopes = @(
+    'DeviceManagementConfiguration.Read.All'
+    'DeviceManagementApps.Read.All'
+    'DeviceManagementManagedDevices.Read.All'
+    'Policy.Read.All'
+)
+$Script:QuickConnectScopes = $Script:QuickConnectApiScopes + @('offline_access', 'openid', 'profile')
 
 # Typical delegated scopes for a custom Intune app (ReadWrite, no Policy.Read.All)
 $Script:DefaultAppRegistrationScopes = @(
@@ -57,7 +65,7 @@ function Resolve-GraphScopes {
         $Script:DefaultAppRegistrationScopes
     }
     else {
-        $Script:GraphApiScopes
+        $Script:QuickConnectApiScopes
     }
 
     foreach ($oauth in @('offline_access', 'openid', 'profile')) {
@@ -259,7 +267,7 @@ function Get-AccessTokenViaDeviceCode {
         [System.Windows.Window]$OwnerWindow,
         [string]$TenantId,
         [string]$ClientId,
-        [string[]]$Scopes = $Script:GraphScopes
+        [string[]]$Scopes = $Script:QuickConnectScopes
     )
 
     $clientId    = if ([string]::IsNullOrWhiteSpace($ClientId)) { $Script:GraphClientId } else { $ClientId.Trim() }
@@ -369,7 +377,7 @@ function Connect-ToGraph {
         [System.Windows.Window]$OwnerWindow,
         [string]$TenantId,
         [string]$ClientId,
-        [string[]]$Scopes = $Script:GraphScopes
+        [string[]]$Scopes = $Script:QuickConnectScopes
     )
 
     Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
