@@ -1,11 +1,12 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Graphical Intune Policy Explorer - reads policies and settings via Microsoft Graph.
+    Graphical Intune Policy Explorer - browse, search, and export Microsoft Intune policies.
 
 .DESCRIPTION
-    Modern WPF interface to browse, search, and export Intune policies.
-    Requires: Microsoft.Graph.Authentication module.
+    Single self-contained WPF script. Browse policies, run tenant analysis (recommendations,
+    health, conflicts), search settings across policies, and export audit reports.
+    Requires Microsoft.Graph.Authentication module.
 
 .EXAMPLE
     .\Show-IntunePoliciesGUI.ps1
@@ -17,6 +18,8 @@ param()
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+$Script:AppVersion = '1.3.0'
 
 # Graph PowerShell built-in public client ID
 $Script:GraphClientId = '14d82eec-204b-4c2f-b7e8-296a70dab67e'
@@ -80,6 +83,17 @@ function Test-HasIntuneGraphSession {
     return (@($Context.Scopes | Where-Object { $_ -match '^(DeviceManagement|Policy\.)' }).Count -gt 0)
 }
 
+function Test-HasRequiredIntuneScopes {
+    param($Context)
+    if (-not $Context) { return $false }
+    $scopes = @($Context.Scopes)
+    return (@($scopes | Where-Object {
+        $_ -in $Script:QuickConnectApiScopes -or
+        $_ -match '^DeviceManagement.*\.Read' -or
+        $_ -match '^DeviceManagement.*\.ReadWrite'
+    }).Count -gt 0)
+}
+
 function Test-MgCommandSupportsContextScope {
     param([string]$CommandName)
     $cmd = Get-Command $CommandName -ErrorAction SilentlyContinue
@@ -135,6 +149,8 @@ $Script:AllPolicies   = [System.Collections.ObjectModel.ObservableCollection[obj
 $Script:IsConnected   = $false
 $Script:CurrentTenant = $null
 $Script:OwnerWindow   = $null
+$Script:SettingsIndex = @()
+$Script:AnalysisData  = $null
 
 function Test-GraphModule {
     return (@(Get-Module -ListAvailable -Name Microsoft.Graph.Authentication).Count -gt 0)
@@ -448,6 +464,7 @@ function Connect-ToGraphUniversal {
         $needsReconnect = $false
         if ($tenantId -and $context.TenantId -ne $tenantId) { $needsReconnect = $true }
         if ($clientId -and $context.ClientId -ne $clientId) { $needsReconnect = $true }
+        if (-not (Test-HasRequiredIntuneScopes -Context $context)) { $needsReconnect = $true }
         if ($needsReconnect) {
             Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
             $context = $null
@@ -511,37 +528,76 @@ function Connect-ToGraphUniversal {
         "Could not sign in to Microsoft Graph.`n`n$($errors -join "`n`n")`n`n$hint")
 }
 
+function Get-GraphProperty {
+    param(
+        $Object,
+        [string]$Name,
+        $Default = $null
+    )
+    if ($null -eq $Object) { return $Default }
+    if ($Object -is [System.Collections.IDictionary]) {
+        if ($Object.Contains($Name)) { return $Object[$Name] }
+        return $Default
+    }
+    $prop = $Object.PSObject.Properties[$Name]
+    if ($prop) { return $prop.Value }
+    return $Default
+}
+
 function Invoke-GraphPaged {
     param([string]$Uri)
     $results = [System.Collections.Generic.List[object]]::new()
     $next    = $Uri
     while ($next) {
         $page = Invoke-MgGraphRequest -Method GET -Uri $next -OutputType PSObject
-        if ($page.value) { $results.AddRange(@($page.value)) }
-        else             { $results.Add($page); break }
-        $next = $page.'@odata.nextLink'
+        if ($page -is [System.Array]) {
+            if ($page.Count -gt 0) { $results.AddRange(@($page)) }
+            break
+        }
+        $value = Get-GraphProperty -Object $page -Name 'value'
+        if ($null -ne $value) {
+            $results.AddRange(@($value))
+        }
+        elseif ($null -ne (Get-GraphProperty -Object $page -Name 'id')) {
+            $results.Add($page)
+            break
+        }
+        else {
+            break
+        }
+        $next = Get-GraphProperty -Object $page -Name '@odata.nextLink'
     }
     return $results
 }
 
 function Get-PolicyListItem {
     param($Policy, [string]$Type, [hashtable]$Source)
+    $name = Get-GraphProperty -Object $Policy -Name 'displayName'
+    if ([string]::IsNullOrWhiteSpace($name)) {
+        $name = Get-GraphProperty -Object $Policy -Name 'name'
+    }
+    if ([string]::IsNullOrWhiteSpace($name)) {
+        $name = Get-GraphProperty -Object $Policy -Name 'id'
+    }
+    $odataType = Get-GraphProperty -Object $Policy -Name '@odata.type'
     [PSCustomObject]@{
         Type         = $Type
-        Name         = if ($Policy.displayName) { $Policy.displayName } else { $Policy.name }
-        Id           = $Policy.id
-        Created      = $Policy.createdDateTime
-        Modified     = $Policy.lastModifiedDateTime
-        Description  = $Policy.description
-        Platform     = if ($Policy.'@odata.type') { ($Policy.'@odata.type' -replace '#microsoft.graph.', '') } else { '' }
-        Endpoint     = $Source.Endpoint
-        DetailExpand = $Source.DetailExpand
-        Raw          = $Policy
+        Name         = $name
+        Id           = Get-GraphProperty -Object $Policy -Name 'id'
+        Created      = Get-GraphProperty -Object $Policy -Name 'createdDateTime'
+        Modified     = Get-GraphProperty -Object $Policy -Name 'lastModifiedDateTime'
+        Description  = Get-GraphProperty -Object $Policy -Name 'description'
+        Platform     = if ($odataType) { ($odataType -replace '#microsoft.graph.', '') } else { '' }
+        Endpoint         = $Source.Endpoint
+        DetailExpand     = $Source.DetailExpand
+        Raw              = $Policy
+        AssignmentCount  = $null
     }
 }
 
 function Get-AllIntunePolicies {
-    $items = [System.Collections.Generic.List[object]]::new()
+    $items  = [System.Collections.Generic.List[object]]::new()
+    $errors = [System.Collections.Generic.List[string]]::new()
     foreach ($entry in $Script:PolicySources.GetEnumerator()) {
         $type   = $entry.Key
         $source = $entry.Value
@@ -549,14 +605,21 @@ function Get-AllIntunePolicies {
             $uri  = "https://graph.microsoft.com/beta/$($source.Endpoint)?`$top=999"
             $list = Invoke-GraphPaged -Uri $uri
             foreach ($p in $list) {
-                $items.Add((Get-PolicyListItem -Policy $p -Type $type -Source $source))
+                try {
+                    $items.Add((Get-PolicyListItem -Policy $p -Type $type -Source $source))
+                }
+                catch {
+                    $id = Get-GraphProperty -Object $p -Name 'id'
+                    $label = if ($id) { "$type ($id)" } else { $type }
+                    $errors.Add("$label`: $($_.Exception.Message)")
+                }
             }
         }
         catch {
-            Write-Warning "Could not load '$type': $($_.Exception.Message)"
+            $errors.Add("$type`: $($_.Exception.Message)")
         }
     }
-    return $items
+    return [PSCustomObject]@{ Policies = $items; Errors = $errors }
 }
 
 function Get-PolicyDetail {
@@ -581,19 +644,28 @@ function Convert-PolicyToSettingsList {
 
     switch -Regex ($Type) {
         'Settings Catalog' {
-            foreach ($s in @($Detail.settings)) {
-                Add-Row 'Settings Catalog' $s.settingInstance.settingDefinitionId $s.settingInstance
+            $settings = Get-GraphProperty -Object $Detail -Name 'settings'
+            foreach ($s in @($(if ($null -ne $settings) { $settings } else { @() }))) {
+                $instance = Get-GraphProperty -Object $s -Name 'settingInstance'
+                $settingId = Get-GraphProperty -Object $instance -Name 'settingDefinitionId'
+                Add-Row 'Settings Catalog' $settingId $instance
             }
         }
         'Administrative Templates' {
-            foreach ($dv in @($Detail.definitionValues)) {
-                $name = if ($dv.definition) { $dv.definition.displayName } else { $dv.definitionId }
+            $definitionValues = Get-GraphProperty -Object $Detail -Name 'definitionValues'
+            foreach ($dv in @($(if ($null -ne $definitionValues) { $definitionValues } else { @() }))) {
+                $definition = Get-GraphProperty -Object $dv -Name 'definition'
+                $name = Get-GraphProperty -Object $definition -Name 'displayName'
+                if ([string]::IsNullOrWhiteSpace($name)) {
+                    $name = Get-GraphProperty -Object $dv -Name 'definitionId'
+                }
                 Add-Row 'ADMX' $name $dv
             }
         }
         'Endpoint Security' {
-            foreach ($s in @($Detail.settings)) {
-                Add-Row 'Endpoint Security' $s.definitionId $s.valueJson
+            $settings = Get-GraphProperty -Object $Detail -Name 'settings'
+            foreach ($s in @($(if ($null -ne $settings) { $settings } else { @() }))) {
+                Add-Row 'Endpoint Security' (Get-GraphProperty -Object $s -Name 'definitionId') (Get-GraphProperty -Object $s -Name 'valueJson')
             }
         }
         default {
@@ -610,6 +682,389 @@ function Convert-PolicyToSettingsList {
         Add-Row 'Info' 'Full object' $Detail
     }
     return $rows
+}
+
+function Format-SettingDisplayValue {
+    param($Value)
+    if ($null -eq $Value) { return '' }
+    if ($Value -is [string] -or $Value -is [ValueType]) { return [string]$Value }
+    try { return ($Value | ConvertTo-Json -Depth 8 -Compress) }
+    catch { return [string]$Value }
+}
+
+function Get-PolicyAssignments {
+    param($Item)
+    try {
+        $uri = "https://graph.microsoft.com/beta/$($Item.Endpoint)/$($Item.Id)/assignments"
+        return @(Invoke-GraphPaged -Uri $uri)
+    }
+    catch {
+        return @()
+    }
+}
+
+function New-RecommendationRow {
+    param(
+        [string]$Status,
+        [string]$Category,
+        [string]$Title,
+        [string]$Detail,
+        [string]$Advice
+    )
+    return [PSCustomObject]@{
+        Status   = $Status
+        Category = $Category
+        Title    = $Title
+        Detail   = $Detail
+        Advice   = $Advice
+    }
+}
+
+function Build-PolicySettingsIndex {
+    param([array]$Policies)
+
+    $index = [System.Collections.Generic.List[object]]::new()
+    $skipSettings = @(
+        '@odata.context', '@odata.type', 'displayName', 'description',
+        'createdDateTime', 'lastModifiedDateTime', 'version', 'roleScopeTagIds'
+    )
+
+    foreach ($p in $Policies) {
+        try {
+            $detail   = Get-PolicyDetail -Item $p
+            $settings = Convert-PolicyToSettingsList -Detail $detail -Type $p.Type
+            foreach ($s in $settings) {
+                if ($s.Setting -in $skipSettings) { continue }
+                $valueText = Format-SettingDisplayValue $s.Value
+                $index.Add([PSCustomObject]@{
+                    PolicyType = $p.Type
+                    PolicyName = $p.Name
+                    PolicyId   = $p.Id
+                    Category   = $s.Category
+                    Setting    = $s.Setting
+                    Value      = $valueText
+                    SearchBlob = "$($s.Setting) $valueText".ToLowerInvariant()
+                })
+            }
+        }
+        catch {
+            continue
+        }
+    }
+    return @($index)
+}
+
+function Get-IntuneRecommendations {
+    param(
+        [array]$Policies,
+        [array]$SettingsIndex
+    )
+
+    $rows = [System.Collections.Generic.List[object]]::new()
+    $blob = ($SettingsIndex | ForEach-Object { $_.SearchBlob }) -join ' '
+
+    function Test-HasType([string]$TypeName) {
+        return (@($Policies | Where-Object { $_.Type -eq $TypeName }).Count -gt 0)
+    }
+    function Test-Blob([string]$Pattern) {
+        return ($blob -match $Pattern)
+    }
+    function Test-Platform([string]$Pattern) {
+        return (@($Policies | Where-Object { $_.Platform -match $Pattern }).Count -gt 0)
+    }
+
+    $complianceCount = @($Policies | Where-Object { $_.Type -eq 'Compliance' }).Count
+    if ($complianceCount -gt 0) {
+        $rows.Add((New-RecommendationRow 'Pass' 'Compliance' 'Device compliance policies defined' "$complianceCount compliance policy(ies) found." 'Review assignments and minimum OS/password requirements periodically.'))
+    }
+    else {
+        $rows.Add((New-RecommendationRow 'Fail' 'Compliance' 'Device compliance policies defined' 'No compliance policies found.' 'Create Windows/iOS/Android compliance policies to enforce minimum security requirements.'))
+    }
+
+    if (Test-Blob 'osminimumversion|minversion|minimumos|operatingsystemversion') {
+        $rows.Add((New-RecommendationRow 'Pass' 'Compliance' 'Minimum OS version enforced' 'Compliance or configuration includes minimum OS settings.' 'Keep minimum versions aligned with vendor support lifecycles.'))
+    }
+    else {
+        $rows.Add((New-RecommendationRow 'Warning' 'Compliance' 'Minimum OS version enforced' 'No explicit minimum OS setting detected.' 'Add a compliance policy with minimum OS version for supported platforms.'))
+    }
+
+    if (Test-Blob 'bitlocker|encryption|requiredeviceencryption|personalvault|filevault') {
+        $rows.Add((New-RecommendationRow 'Pass' 'Encryption' 'Device encryption configured' 'Encryption-related settings found in policies.' 'Verify encryption applies to all corporate device groups.'))
+    }
+    else {
+        $rows.Add((New-RecommendationRow 'Fail' 'Encryption' 'Device encryption configured' 'No BitLocker/FileVault/encryption settings detected.' 'Configure BitLocker (Windows) or platform encryption via compliance or configuration profile.'))
+    }
+
+    if ((Test-Blob 'windowsupdate|qualitydeferral|featuredeferral|deadline|autopatch') -or (Test-Platform 'windowsUpdateForBusiness')) {
+        $rows.Add((New-RecommendationRow 'Pass' 'Updates' 'Windows update management' 'Update rings or Windows Update for Business settings detected.' 'Validate deferral periods and deadline enforcement for production rings.'))
+    }
+    else {
+        $rows.Add((New-RecommendationRow 'Warning' 'Updates' 'Windows update management' 'No dedicated update policy detected.' 'Use Settings Catalog or Update Rings to manage quality/feature updates.'))
+    }
+
+    if (Test-Blob 'defender|antivirus|windowdefender|tamperprotection|mde') {
+        $rows.Add((New-RecommendationRow 'Pass' 'Endpoint Protection' 'Microsoft Defender settings present' 'Defender or antivirus-related settings found.' 'Consider Endpoint Security antivirus template for centralized management.'))
+    }
+    else {
+        $rows.Add((New-RecommendationRow 'Warning' 'Endpoint Protection' 'Microsoft Defender settings present' 'No Defender-specific settings detected in loaded policies.' 'Deploy Defender antivirus/EDR baseline via Endpoint Security or Settings Catalog.'))
+    }
+
+    if (Test-Blob 'firewall|windowspolicyfirewall|networkprotection') {
+        $rows.Add((New-RecommendationRow 'Pass' 'Network' 'Firewall policy configured' 'Firewall-related settings detected.' 'Ensure firewall rules align with least-privilege network access.'))
+    }
+    else {
+        $rows.Add((New-RecommendationRow 'Warning' 'Network' 'Firewall policy configured' 'No firewall settings detected.' 'Configure Windows Firewall via Settings Catalog or Endpoint Security.'))
+    }
+
+    if (Test-Blob 'attacksurfacereduction|asrrules|asr') {
+        $rows.Add((New-RecommendationRow 'Pass' 'Endpoint Protection' 'Attack Surface Reduction (ASR)' 'ASR-related settings found.' 'Audit ASR rules in audit mode before switching to block.'))
+    }
+    else {
+        $rows.Add((New-RecommendationRow 'Warning' 'Endpoint Protection' 'Attack Surface Reduction (ASR)' 'No ASR rules detected.' 'Enable ASR rules via Endpoint Security Attack Surface Reduction template.'))
+    }
+
+    if (Test-HasType 'Endpoint Security') {
+        $rows.Add((New-RecommendationRow 'Pass' 'Endpoint Security' 'Endpoint Security intents deployed' 'Endpoint Security policies are in use.' 'Map intents to Microsoft security baselines where possible.'))
+    }
+    else {
+        $rows.Add((New-RecommendationRow 'Warning' 'Endpoint Security' 'Endpoint Security intents deployed' 'No Endpoint Security policies found.' 'Use Endpoint Security for AV, disk encryption, firewall, and ASR templates.'))
+    }
+
+    if (Test-HasType 'App Protection (iOS)') {
+        $rows.Add((New-RecommendationRow 'Pass' 'App Protection' 'iOS app protection (MAM)' 'iOS app protection policy found.' 'Assign to all BYOD iOS users accessing corporate data.'))
+    }
+    else {
+        $rows.Add((New-RecommendationRow 'Warning' 'App Protection' 'iOS app protection (MAM)' 'No iOS app protection policy.' 'Create iOS MAM policy for unmanaged devices accessing corporate apps.'))
+    }
+
+    if (Test-HasType 'App Protection (Android)') {
+        $rows.Add((New-RecommendationRow 'Pass' 'App Protection' 'Android app protection (MAM)' 'Android app protection policy found.' 'Require PIN/biometrics and block jailbroken devices.'))
+    }
+    else {
+        $rows.Add((New-RecommendationRow 'Warning' 'App Protection' 'Android app protection (MAM)' 'No Android app protection policy.' 'Create Android MAM policy for mobile productivity apps.'))
+    }
+
+    if (Test-HasType 'Windows Autopilot') {
+        $rows.Add((New-RecommendationRow 'Pass' 'Provisioning' 'Windows Autopilot deployment profile' 'Autopilot profile(s) configured.' 'Validate ESP (Enrollment Status Page) and assignment to device groups.'))
+    }
+    else {
+        $rows.Add((New-RecommendationRow 'Warning' 'Provisioning' 'Windows Autopilot deployment profile' 'No Autopilot deployment profile found.' 'Create Autopilot profiles for zero-touch Windows provisioning.'))
+    }
+
+    if (Test-HasType 'Settings Catalog') {
+        $rows.Add((New-RecommendationRow 'Pass' 'Modern Management' 'Settings Catalog in use' 'Settings Catalog policies present (recommended over legacy profiles).' 'Migrate remaining legacy profiles to Settings Catalog where supported.'))
+    }
+    else {
+        $rows.Add((New-RecommendationRow 'Warning' 'Modern Management' 'Settings Catalog in use' 'No Settings Catalog policies detected.' 'Prefer Settings Catalog for new Windows configuration policies.'))
+    }
+
+    if (Test-HasType 'Administrative Templates') {
+        $rows.Add((New-RecommendationRow 'Pass' 'Modern Management' 'Administrative Templates (ADMX)' 'ADMX-backed policies found.' 'Document GPO migration path if co-managing with on-prem AD.'))
+    }
+    else {
+        $rows.Add((New-RecommendationRow 'Warning' 'Modern Management' 'Administrative Templates (ADMX)' 'No ADMX administrative template policies.' 'Use ADMX templates only when Settings Catalog lacks required settings.'))
+    }
+
+    if (Test-Blob 'password|passcode|pin|simplepin') {
+        $rows.Add((New-RecommendationRow 'Pass' 'Identity' 'Device password / PIN requirements' 'Password or PIN requirements detected.' 'Align complexity with your identity standards (e.g. 6+ digit PIN on mobile).'))
+    }
+    else {
+        $rows.Add((New-RecommendationRow 'Warning' 'Identity' 'Device password / PIN requirements' 'No password/PIN settings detected in policies.' 'Enforce passcode via compliance or app protection policies.'))
+    }
+
+    if (Test-HasType 'Mobile App Configurations') {
+        $rows.Add((New-RecommendationRow 'Pass' 'Apps' 'Mobile app configuration policies' 'App configuration policies found.' 'Use app config for managed apps (Outlook, Edge) with pre-defined settings.'))
+    }
+    else {
+        $rows.Add((New-RecommendationRow 'Warning' 'Apps' 'Mobile app configuration policies' 'No mobile app configuration policies.' 'Optional: add app config for consistent mobile app experience.'))
+    }
+
+    return @($rows)
+}
+
+function Get-PolicyHealthFindings {
+    param(
+        [array]$Policies,
+        [hashtable]$AssignmentMap
+    )
+
+    $findings = [System.Collections.Generic.List[object]]::new()
+    $staleCutoff = (Get-Date).AddMonths(-12)
+
+    foreach ($p in $Policies) {
+        $assignCount = if ($AssignmentMap.ContainsKey($p.Id)) { $AssignmentMap[$p.Id] } else { 0 }
+        if ($assignCount -eq 0) {
+            $findings.Add([PSCustomObject]@{
+                Severity   = 'Warning'
+                PolicyName = $p.Name
+                PolicyType = $p.Type
+                Finding    = 'Unassigned'
+                Detail     = 'Policy has no group or user assignments.'
+            })
+        }
+
+        if ($p.Modified) {
+            try {
+                $modified = [datetime]$p.Modified
+                if ($modified -lt $staleCutoff) {
+                    $findings.Add([PSCustomObject]@{
+                        Severity   = 'Info'
+                        PolicyName = $p.Name
+                        PolicyType = $p.Type
+                        Finding    = 'Stale'
+                        Detail     = "Last modified $($modified.ToString('yyyy-MM-dd')) (>12 months ago)."
+                    })
+                }
+            }
+            catch { }
+        }
+    }
+
+    foreach ($group in ($Policies | Group-Object -Property Name | Where-Object { $_.Count -gt 1 })) {
+        $findings.Add([PSCustomObject]@{
+            Severity   = 'Warning'
+            PolicyName = $group.Name
+            PolicyType = ($group.Group | Select-Object -ExpandProperty Type -Unique) -join ', '
+            Finding    = 'Duplicate name'
+            Detail     = "$($group.Count) policies share the same display name."
+        })
+    }
+
+    return @($findings)
+}
+
+function Get-SettingConflicts {
+    param([array]$SettingsIndex)
+
+    $conflicts = [System.Collections.Generic.List[object]]::new()
+    $groups = $SettingsIndex | Where-Object { $_.Setting -and $_.Setting -notmatch '^@odata' } |
+        Group-Object -Property Setting |
+        Where-Object { $_.Count -gt 1 }
+
+    foreach ($g in $groups) {
+        $distinctValues = @($g.Group | Select-Object -ExpandProperty Value -Unique)
+        if ($distinctValues.Count -le 1) { continue }
+
+        $policyList = ($g.Group | ForEach-Object { "$($_.PolicyName) ($($_.PolicyType))" }) -join '; '
+        $valueList  = ($g.Group | ForEach-Object { $_.Value }) -join ' | '
+        $conflicts.Add([PSCustomObject]@{
+            Setting  = $g.Name
+            Policies = $policyList
+            Values   = $valueList
+            Detail   = "$($g.Count) policies configure '$($g.Name)' with $($distinctValues.Count) different values."
+        })
+    }
+    return @($conflicts)
+}
+
+function Invoke-TenantAnalysis {
+    param([array]$Policies)
+
+    $assignmentMap = @{}
+    $total = $Policies.Count
+    $i = 0
+
+    foreach ($p in $Policies) {
+        $i++
+        Set-Status "Analyzing assignments ($i/$total): $($p.Name)"
+        $assignments = Get-PolicyAssignments -Item $p
+        $assignmentMap[$p.Id] = @($assignments).Count
+        $p | Add-Member -NotePropertyName AssignmentCount -NotePropertyValue @($assignments).Count -Force
+    }
+
+    Set-Status 'Building settings index (this may take a while)...'
+    $settingsIndex = Build-PolicySettingsIndex -Policies $Policies
+
+    Set-Status 'Evaluating recommendations and conflicts...'
+    $recommendations = Get-IntuneRecommendations -Policies $Policies -SettingsIndex $settingsIndex
+    $health          = Get-PolicyHealthFindings -Policies $Policies -AssignmentMap $assignmentMap
+    $conflicts       = Get-SettingConflicts -SettingsIndex $settingsIndex
+
+    return [PSCustomObject]@{
+        SettingsIndex   = $settingsIndex
+        Recommendations = $recommendations
+        Health          = $health
+        Conflicts       = $conflicts
+        AssignmentMap   = $assignmentMap
+        AnalyzedAt      = Get-Date
+    }
+}
+
+function Search-PolicySettings {
+    param(
+        [string]$Query,
+        [array]$SettingsIndex
+    )
+    if ([string]::IsNullOrWhiteSpace($Query)) { return @() }
+    $q = $Query.Trim().ToLowerInvariant()
+    return @($SettingsIndex | Where-Object {
+        $_.Setting -like "*$q*" -or $_.Value -like "*$q*" -or $_.SearchBlob -like "*$q*"
+    })
+}
+
+function Export-AuditReport {
+    param(
+        [array]$Policies,
+        $Analysis,
+        [string]$Folder
+    )
+
+    $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+    $path      = Join-Path $Folder "IntuneAuditReport_$timestamp.html"
+    $tenant    = $Script:CurrentTenant
+    $passCount = @($Analysis.Recommendations | Where-Object { $_.Status -eq 'Pass' }).Count
+    $warnCount = @($Analysis.Recommendations | Where-Object { $_.Status -eq 'Warning' }).Count
+    $failCount = @($Analysis.Recommendations | Where-Object { $_.Status -eq 'Fail' }).Count
+
+    $sb = [System.Text.StringBuilder]::new()
+    [void]$sb.AppendLine(@'
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
+<title>Intune Audit Report</title>
+<style>
+body{font-family:Segoe UI,sans-serif;margin:2rem;background:#f5f7fa;color:#1a1a2e}
+h1{color:#0078d4}h2{color:#2d3748;border-bottom:2px solid #0078d4;padding-bottom:.3rem;margin-top:2rem}
+table{border-collapse:collapse;width:100%;margin:1rem 0;background:#fff;box-shadow:0 1px 4px rgba(0,0,0,.08)}
+th{background:#0078d4;color:#fff;text-align:left;padding:.6rem .8rem}
+td{padding:.5rem .8rem;border-bottom:1px solid #e2e8f0;vertical-align:top;word-break:break-word}
+tr:hover td{background:#edf2f7}.meta{color:#64748b;font-size:.9rem}
+.pass{color:#166534}.warn{color:#9a3412}.fail{color:#991b1b}
+.summary{display:flex;gap:1rem;flex-wrap:wrap;margin:1rem 0}
+.card{background:#fff;padding:1rem 1.2rem;border-radius:8px;box-shadow:0 1px 4px rgba(0,0,0,.08);min-width:120px}
+.card strong{font-size:1.4rem;display:block}
+</style></head><body>
+'@)
+    [void]$sb.AppendLine('<h1>Intune Policy Audit Report</h1>')
+    [void]$sb.AppendLine("<p class='meta'>Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm') | Tenant: $tenant | Policies: $($Policies.Count) | Version: $($Script:AppVersion)</p>")
+    [void]$sb.AppendLine("<div class='summary'><div class='card pass'><strong>$passCount</strong>Passed</div><div class='card warn'><strong>$warnCount</strong>Warnings</div><div class='card fail'><strong>$failCount</strong>Failed</div></div>")
+
+    [void]$sb.AppendLine('<h2>Recommendations</h2><table><tr><th>Status</th><th>Category</th><th>Check</th><th>Detail</th><th>Advice</th></tr>')
+    foreach ($r in $Analysis.Recommendations) {
+        $cls = switch ($r.Status) { 'Pass' { 'pass' } 'Fail' { 'fail' } default { 'warn' } }
+        [void]$sb.AppendLine("<tr class='$cls'><td>$([System.Web.HttpUtility]::HtmlEncode($r.Status))</td><td>$([System.Web.HttpUtility]::HtmlEncode($r.Category))</td><td>$([System.Web.HttpUtility]::HtmlEncode($r.Title))</td><td>$([System.Web.HttpUtility]::HtmlEncode($r.Detail))</td><td>$([System.Web.HttpUtility]::HtmlEncode($r.Advice))</td></tr>")
+    }
+    [void]$sb.AppendLine('</table>')
+
+    [void]$sb.AppendLine('<h2>Policy Health</h2><table><tr><th>Severity</th><th>Policy</th><th>Type</th><th>Finding</th><th>Detail</th></tr>')
+    foreach ($h in $Analysis.Health) {
+        [void]$sb.AppendLine("<tr><td>$([System.Web.HttpUtility]::HtmlEncode($h.Severity))</td><td>$([System.Web.HttpUtility]::HtmlEncode($h.PolicyName))</td><td>$([System.Web.HttpUtility]::HtmlEncode($h.PolicyType))</td><td>$([System.Web.HttpUtility]::HtmlEncode($h.Finding))</td><td>$([System.Web.HttpUtility]::HtmlEncode($h.Detail))</td></tr>")
+    }
+    [void]$sb.AppendLine('</table>')
+
+    [void]$sb.AppendLine('<h2>Setting Conflicts</h2><table><tr><th>Setting</th><th>Policies</th><th>Values</th><th>Detail</th></tr>')
+    foreach ($c in $Analysis.Conflicts) {
+        [void]$sb.AppendLine("<tr><td>$([System.Web.HttpUtility]::HtmlEncode($c.Setting))</td><td>$([System.Web.HttpUtility]::HtmlEncode($c.Policies))</td><td><pre style='margin:0;white-space:pre-wrap'>$([System.Web.HttpUtility]::HtmlEncode($c.Values))</pre></td><td>$([System.Web.HttpUtility]::HtmlEncode($c.Detail))</td></tr>")
+    }
+    [void]$sb.AppendLine('</table>')
+
+    [void]$sb.AppendLine('<h2>Policy Inventory</h2><table><tr><th>Type</th><th>Name</th><th>Platform</th><th>Assignments</th><th>Last modified</th></tr>')
+    foreach ($p in ($Policies | Sort-Object Type, Name)) {
+        $ac = if ($null -ne $p.AssignmentCount) { $p.AssignmentCount } else { '-' }
+        [void]$sb.AppendLine("<tr><td>$([System.Web.HttpUtility]::HtmlEncode($p.Type))</td><td>$([System.Web.HttpUtility]::HtmlEncode($p.Name))</td><td>$([System.Web.HttpUtility]::HtmlEncode($p.Platform))</td><td>$ac</td><td>$([System.Web.HttpUtility]::HtmlEncode($p.Modified))</td></tr>")
+    }
+    [void]$sb.AppendLine('</table></body></html>')
+
+    $sb.ToString() | Set-Content -Path $path -Encoding UTF8
+    return @($path)
 }
 
 function Export-Policies {
@@ -916,10 +1371,11 @@ $xaml = @'
           <Border Grid.Row="1" Background="{StaticResource Surface}" CornerRadius="10" BorderBrush="{StaticResource Border}" BorderThickness="1">
             <DataGrid x:Name="DgPolicies" IsReadOnly="True">
               <DataGrid.Columns>
-                <DataGridTextColumn Header="Type" Binding="{Binding Type}" Width="180"/>
-                <DataGridTextColumn Header="Name" Binding="{Binding Name}" Width="*" MinWidth="200"/>
-                <DataGridTextColumn Header="Platform" Binding="{Binding Platform}" Width="160"/>
-                <DataGridTextColumn Header="Last modified" Binding="{Binding Modified}" Width="150"/>
+                <DataGridTextColumn Header="Type" Binding="{Binding Type}" Width="170"/>
+                <DataGridTextColumn Header="Name" Binding="{Binding Name}" Width="*" MinWidth="180"/>
+                <DataGridTextColumn Header="Platform" Binding="{Binding Platform}" Width="140"/>
+                <DataGridTextColumn Header="Assignments" Binding="{Binding AssignmentCount}" Width="90"/>
+                <DataGridTextColumn Header="Last modified" Binding="{Binding Modified}" Width="140"/>
               </DataGrid.Columns>
             </DataGrid>
           </Border>
@@ -959,6 +1415,95 @@ $xaml = @'
       <TabItem>
         <TabItem.Header>
           <StackPanel Orientation="Horizontal">
+            <Path Data="M12,2A10,10 0 0,0 2,12A10,10 0 0,0 12,22A10,10 0 0,0 22,12A10,10 0 0,0 12,2M11,17V16H9V14H13V13H11A1,1 0 0,1 10,12V9A1,1 0 0,1 11,8H13V10H11V12H13A1,1 0 0,1 14,13V16A1,1 0 0,1 13,17H11Z" Fill="{Binding RelativeSource={RelativeSource AncestorType=TabItem}, Path=Foreground}" Width="14" Height="14" Stretch="Uniform" Margin="0,0,8,0"/>
+            <TextBlock Text="Insights" VerticalAlignment="Center"/>
+          </StackPanel>
+        </TabItem.Header>
+        <Grid Margin="0,8,0,0">
+          <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+          </Grid.RowDefinitions>
+          <Border Background="{StaticResource Surface}" CornerRadius="10" Padding="16" BorderBrush="{StaticResource Border}" BorderThickness="1" Margin="0,0,0,10">
+            <Grid>
+              <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+              </Grid.ColumnDefinitions>
+              <StackPanel>
+                <TextBlock Text="Tenant analysis" FontSize="15" FontWeight="SemiBold"/>
+                <TextBlock x:Name="TxtAnalysisSummary" Foreground="{StaticResource TextMuted}" TextWrapping="Wrap" Margin="0,4,0,0"
+                           Text="Run analysis for recommendations, policy health, setting conflicts, and cross-policy search."/>
+              </StackPanel>
+              <Button x:Name="BtnAnalyze" Grid.Column="1" Content="Analyze tenant" VerticalAlignment="Center" IsEnabled="False" MinWidth="140"/>
+            </Grid>
+          </Border>
+          <Border Grid.Row="1" Background="{StaticResource Surface}" CornerRadius="10" BorderBrush="{StaticResource Border}" BorderThickness="1">
+            <TabControl Margin="8">
+              <TabItem Header="Recommendations">
+                <DataGrid x:Name="DgRecommendations" IsReadOnly="True" Margin="4">
+                  <DataGrid.Columns>
+                    <DataGridTextColumn Header="Status" Binding="{Binding Status}" Width="80"/>
+                    <DataGridTextColumn Header="Category" Binding="{Binding Category}" Width="130"/>
+                    <DataGridTextColumn Header="Check" Binding="{Binding Title}" Width="*" MinWidth="200"/>
+                    <DataGridTextColumn Header="Detail" Binding="{Binding Detail}" Width="2*" MinWidth="220"/>
+                    <DataGridTextColumn Header="Advice" Binding="{Binding Advice}" Width="2*" MinWidth="220"/>
+                  </DataGrid.Columns>
+                </DataGrid>
+              </TabItem>
+              <TabItem Header="Policy health">
+                <DataGrid x:Name="DgHealth" IsReadOnly="True" Margin="4">
+                  <DataGrid.Columns>
+                    <DataGridTextColumn Header="Severity" Binding="{Binding Severity}" Width="90"/>
+                    <DataGridTextColumn Header="Policy" Binding="{Binding PolicyName}" Width="*" MinWidth="180"/>
+                    <DataGridTextColumn Header="Type" Binding="{Binding PolicyType}" Width="160"/>
+                    <DataGridTextColumn Header="Finding" Binding="{Binding Finding}" Width="120"/>
+                    <DataGridTextColumn Header="Detail" Binding="{Binding Detail}" Width="2*" MinWidth="220"/>
+                  </DataGrid.Columns>
+                </DataGrid>
+              </TabItem>
+              <TabItem Header="Conflicts">
+                <DataGrid x:Name="DgConflicts" IsReadOnly="True" Margin="4">
+                  <DataGrid.Columns>
+                    <DataGridTextColumn Header="Setting" Binding="{Binding Setting}" Width="*" MinWidth="180"/>
+                    <DataGridTextColumn Header="Policies" Binding="{Binding Policies}" Width="2*" MinWidth="240"/>
+                    <DataGridTextColumn Header="Values" Binding="{Binding Values}" Width="2*" MinWidth="200"/>
+                    <DataGridTextColumn Header="Detail" Binding="{Binding Detail}" Width="*" MinWidth="180"/>
+                  </DataGrid.Columns>
+                </DataGrid>
+              </TabItem>
+              <TabItem Header="Find setting">
+                <Grid Margin="4">
+                  <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="*"/>
+                  </Grid.RowDefinitions>
+                  <Grid Margin="0,0,0,8">
+                    <Grid.ColumnDefinitions>
+                      <ColumnDefinition Width="*"/>
+                      <ColumnDefinition Width="Auto"/>
+                    </Grid.ColumnDefinitions>
+                    <TextBox x:Name="TxtFindSetting" Margin="0,0,8,0"/>
+                    <Button x:Name="BtnFindSetting" Grid.Column="1" Content="Search" Style="{StaticResource SecondaryButton}" IsEnabled="False" MinWidth="100"/>
+                  </Grid>
+                  <DataGrid x:Name="DgFindResults" Grid.Row="1" IsReadOnly="True">
+                    <DataGrid.Columns>
+                      <DataGridTextColumn Header="Policy" Binding="{Binding PolicyName}" Width="*" MinWidth="180"/>
+                      <DataGridTextColumn Header="Type" Binding="{Binding PolicyType}" Width="150"/>
+                      <DataGridTextColumn Header="Setting" Binding="{Binding Setting}" Width="*" MinWidth="180"/>
+                      <DataGridTextColumn Header="Value" Binding="{Binding Value}" Width="2*" MinWidth="220"/>
+                    </DataGrid.Columns>
+                  </DataGrid>
+                </Grid>
+              </TabItem>
+            </TabControl>
+          </Border>
+        </Grid>
+      </TabItem>
+
+      <TabItem>
+        <TabItem.Header>
+          <StackPanel Orientation="Horizontal">
             <Path Data="M14,2H6A2,2 0 0,0 4,4V20A2,2 0 0,0 6,22H18A2,2 0 0,0 20,20V8L14,2M18,20H6V4H13V9H18V20Z" Fill="{Binding RelativeSource={RelativeSource AncestorType=TabItem}, Path=Foreground}" Width="14" Height="14" Stretch="Uniform" Margin="0,0,8,0"/>
             <TextBlock Text="Export" VerticalAlignment="Center"/>
           </StackPanel>
@@ -968,12 +1513,13 @@ $xaml = @'
           <StackPanel MaxWidth="640" HorizontalAlignment="Left">
             <TextBlock Text="Export policies" FontSize="18" FontWeight="SemiBold" Margin="0,0,0,8"/>
             <TextBlock Foreground="{StaticResource TextMuted}" TextWrapping="Wrap" Margin="0,0,0,20"
-                       Text="Export selected policies or the full overview including settings."/>
+                       Text="Export policies, settings, or a full audit report with recommendations and health findings."/>
             <TextBlock Text="Format" FontWeight="SemiBold" Margin="0,0,0,6"/>
-            <ComboBox x:Name="CmbExportFormat" Width="280" HorizontalAlignment="Left" Margin="0,0,0,16">
+            <ComboBox x:Name="CmbExportFormat" Width="360" HorizontalAlignment="Left" Margin="0,0,0,16">
               <ComboBoxItem Content="JSON (full, including raw data)" IsSelected="True"/>
               <ComboBoxItem Content="CSV (overview + separate settings file)"/>
               <ComboBoxItem Content="HTML (readable report)"/>
+              <ComboBoxItem Content="HTML Audit Report (recommendations + health + conflicts)"/>
             </ComboBox>
             <TextBlock Text="Scope" FontWeight="SemiBold" Margin="0,0,0,6"/>
             <ComboBox x:Name="CmbExportScope" Width="280" HorizontalAlignment="Left" Margin="0,0,0,20">
@@ -1036,6 +1582,14 @@ $cmbExportScope     = $window.FindName('CmbExportScope')
 $txtExportResult    = $window.FindName('TxtExportResult')
 $txtStatus          = $window.FindName('TxtStatus')
 $txtPolicyCount     = $window.FindName('TxtPolicyCount')
+$btnAnalyze         = $window.FindName('BtnAnalyze')
+$txtAnalysisSummary = $window.FindName('TxtAnalysisSummary')
+$dgRecommendations  = $window.FindName('DgRecommendations')
+$dgHealth           = $window.FindName('DgHealth')
+$dgConflicts        = $window.FindName('DgConflicts')
+$txtFindSetting     = $window.FindName('TxtFindSetting')
+$btnFindSetting     = $window.FindName('BtnFindSetting')
+$dgFindResults      = $window.FindName('DgFindResults')
 
 $dgPolicies.ItemsSource = $Script:AllPolicies
 
@@ -1059,6 +1613,21 @@ $txtTenantId.ToolTip = 'Only for Advanced sign-in: your Entra directory (tenant)
 $txtClientId.ToolTip = 'Only for Advanced sign-in: application (client) ID from your Entra app'
 $txtScopes.ToolTip = 'Optional. Leave empty for recommended Intune read scopes. One Graph scope per line.'
 
+$txtFindSetting.Text = 'Search settings (e.g. BitLocker, Defender, USB)...'
+$txtFindSetting.Add_GotFocus({
+    if ($txtFindSetting.Text -eq 'Search settings (e.g. BitLocker, Defender, USB)...') {
+        $txtFindSetting.Text = ''
+        $txtFindSetting.Foreground = '#1E293B'
+    }
+})
+$txtFindSetting.Add_LostFocus({
+    if ([string]::IsNullOrWhiteSpace($txtFindSetting.Text)) {
+        $txtFindSetting.Text = 'Search settings (e.g. BitLocker, Defender, USB)...'
+        $txtFindSetting.Foreground = '#94A3B8'
+    }
+})
+$txtFindSetting.Foreground = '#94A3B8'
+
 $Script:FilteredView = [System.Windows.Data.CollectionViewSource]::GetDefaultView($Script:AllPolicies)
 $Script:FilteredView.Filter = {
     param($item)
@@ -1078,18 +1647,20 @@ function Set-ConnectedUI([bool]$Connected, $Context = $null) {
         if ($Connected) {
             $statusDot.Fill = '#86EFAC'
             $txtConnectionStatus.Text = 'Connected'
-            $txtSubtitle.Text = "Tenant: $($Context.TenantId)"
+            $txtSubtitle.Text = "Tenant: $($Context.TenantId)  |  v$($Script:AppVersion)"
             $txtTenantInfo.Text = "Client ID: $($Context.ClientId)`nAccount: $($Context.Account)`nTenant ID: $($Context.TenantId)`nScopes: $($Context.Scopes -join ', ')"
             $btnConnect.IsEnabled = $false
             $btnConnectAdvanced.IsEnabled = $false
             $btnDisconnect.IsEnabled = $true
             $btnRefresh.IsEnabled = $true
             $btnExport.IsEnabled = $true
+            $btnAnalyze.IsEnabled = $true
+            $btnFindSetting.IsEnabled = $true
         }
         else {
             $statusDot.Fill = '#FCA5A5'
             $txtConnectionStatus.Text = 'Not connected'
-            $txtSubtitle.Text = 'Connect to Microsoft Graph to load policies'
+            $txtSubtitle.Text = "Connect to Microsoft Graph to load policies  |  v$($Script:AppVersion)"
             $txtTenantInfo.Text = 'Not connected yet.'
             $btnConnect.IsEnabled = $true
             $btnConnectAdvanced.IsEnabled = $true
@@ -1097,22 +1668,95 @@ function Set-ConnectedUI([bool]$Connected, $Context = $null) {
             $btnRefresh.IsEnabled = $false
             $btnExport.IsEnabled = $false
             $btnLoadDetails.IsEnabled = $false
+            $btnAnalyze.IsEnabled = $false
+            $btnFindSetting.IsEnabled = $false
         }
     }
+}
+
+function Show-PolicyLoadSummary {
+    param(
+        [int]$Count,
+        [System.Collections.Generic.List[string]]$Errors,
+        $Context
+    )
+
+    if ($Count -gt 0 -or $Errors.Count -eq 0) { return }
+
+    $scopeHint = if (-not (Test-HasRequiredIntuneScopes -Context $Context)) {
+        "`n`nYour sign-in token is missing Intune read scopes (DeviceManagement*.Read.All).`n" +
+        'Click Disconnect, then sign in again and approve all requested read permissions.'
+    }
+    else { '' }
+
+    $detail = if ($Errors.Count -gt 0) { "`n`nDetails:`n$($Errors -join "`n")" } else { '' }
+    [void][System.Windows.MessageBox]::Show(
+        "Connected, but no policies could be loaded.$scopeHint$detail",
+        'No policies loaded', 'OK', 'Warning')
+}
+
+function Clear-AnalysisUI {
+    $Script:AnalysisData  = $null
+    $Script:SettingsIndex = @()
+    $dgRecommendations.ItemsSource = $null
+    $dgHealth.ItemsSource          = $null
+    $dgConflicts.ItemsSource       = $null
+    $dgFindResults.ItemsSource     = $null
+    $txtAnalysisSummary.Text       = 'Run analysis for recommendations, policy health, setting conflicts, and cross-policy search.'
+}
+
+function Run-AnalysisAsync {
+    if ($Script:AllPolicies.Count -eq 0) {
+        [System.Windows.MessageBox]::Show('Load policies first on the Policies tab.', 'No policies', 'OK', 'Warning') | Out-Null
+        return
+    }
+
+    Set-Status 'Starting tenant analysis...'
+    $btnAnalyze.IsEnabled = $false
+    $Script:AnalysisPolicies = @($Script:AllPolicies)
+
+    $window.Dispatcher.InvokeAsync({
+        try {
+            $analysis = Invoke-TenantAnalysis -Policies $Script:AnalysisPolicies
+            $Script:AnalysisData  = $analysis
+            $Script:SettingsIndex = $analysis.SettingsIndex
+
+            $dgRecommendations.ItemsSource = $analysis.Recommendations
+            $dgHealth.ItemsSource          = $analysis.Health
+            $dgConflicts.ItemsSource       = $analysis.Conflicts
+
+            $pass = @($analysis.Recommendations | Where-Object { $_.Status -eq 'Pass' }).Count
+            $warn = @($analysis.Recommendations | Where-Object { $_.Status -eq 'Warning' }).Count
+            $fail = @($analysis.Recommendations | Where-Object { $_.Status -eq 'Fail' }).Count
+            $txtAnalysisSummary.Text = "Analyzed $($Script:AnalysisPolicies.Count) policies at $($analysis.AnalyzedAt.ToString('yyyy-MM-dd HH:mm')). Recommendations: $pass passed, $warn warnings, $fail failed. Health findings: $($analysis.Health.Count). Conflicts: $($analysis.Conflicts.Count)."
+            $Script:FilteredView.Refresh()
+            Set-Status 'Analysis complete.'
+        }
+        catch {
+            Set-Status "Analysis error: $($_.Exception.Message)"
+            [System.Windows.MessageBox]::Show($_.Exception.Message, 'Analysis error', 'OK', 'Error') | Out-Null
+        }
+        finally {
+            $btnAnalyze.IsEnabled = $Script:IsConnected
+        }
+    }) | Out-Null
 }
 
 function Load-PoliciesAsync {
     Set-Status 'Loading policies from Microsoft Graph...'
     $btnRefresh.IsEnabled = $false
+    $Script:GraphContext = Get-MgGraphSession
     $window.Dispatcher.InvokeAsync({
         try {
+            Clear-AnalysisUI
             $Script:AllPolicies.Clear()
-            $list = Get-AllIntunePolicies
-            foreach ($p in ($list | Sort-Object Type, Name)) {
+            $result = Get-AllIntunePolicies
+            foreach ($p in ($result.Policies | Sort-Object Type, Name)) {
                 [void]$Script:AllPolicies.Add($p)
             }
             $txtPolicyCount.Text = "$($Script:AllPolicies.Count) policies"
             Set-Status "Done. $($Script:AllPolicies.Count) policies loaded."
+            Show-PolicyLoadSummary -Count $Script:AllPolicies.Count -Errors $result.Errors -Context $Script:GraphContext
         }
         catch {
             Set-Status "Load error: $($_.Exception.Message)"
@@ -1179,6 +1823,7 @@ $btnDisconnect.Add_Click({
     try { Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null } catch {}
     $Script:IsConnected = $false
     $Script:AllPolicies.Clear()
+    Clear-AnalysisUI
     $dgSettings.ItemsSource = $null
     $txtPolicyCount.Text = '0 policies'
     Set-ConnectedUI -Connected $false
@@ -1186,6 +1831,46 @@ $btnDisconnect.Add_Click({
 })
 
 $btnRefresh.Add_Click({ Load-PoliciesAsync })
+
+$btnAnalyze.Add_Click({ Run-AnalysisAsync })
+
+$btnFindSetting.Add_Click({
+    $query = $txtFindSetting.Text
+    if ($query -eq 'Search settings (e.g. BitLocker, Defender, USB)...') { $query = '' }
+    if ([string]::IsNullOrWhiteSpace($query)) {
+        [System.Windows.MessageBox]::Show('Enter a setting name or value to search.', 'Search', 'OK', 'Warning') | Out-Null
+        return
+    }
+    if (-not $Script:SettingsIndex -or $Script:SettingsIndex.Count -eq 0) {
+        if ($Script:AllPolicies.Count -eq 0) {
+            [System.Windows.MessageBox]::Show('Load policies first, then run Analyze tenant.', 'No data', 'OK', 'Warning') | Out-Null
+            return
+        }
+        Set-Status 'Building settings index for search...'
+        $btnFindSetting.IsEnabled = $false
+        $Script:FindSettingQuery = $query
+        $window.Dispatcher.InvokeAsync({
+            try {
+                $Script:SettingsIndex = Build-PolicySettingsIndex -Policies @($Script:AllPolicies)
+                $dgFindResults.ItemsSource = Search-PolicySettings -Query $Script:FindSettingQuery -SettingsIndex $Script:SettingsIndex
+                Set-Status "Found $(@($dgFindResults.ItemsSource).Count) matches."
+            }
+            catch {
+                Set-Status "Search error: $($_.Exception.Message)"
+            }
+            finally {
+                $btnFindSetting.IsEnabled = $Script:IsConnected
+            }
+        }) | Out-Null
+        return
+    }
+    $dgFindResults.ItemsSource = Search-PolicySettings -Query $query -SettingsIndex $Script:SettingsIndex
+    Set-Status "Found $(@($dgFindResults.ItemsSource).Count) matches."
+})
+
+$txtFindSetting.Add_KeyDown({
+    if ($_.Key -eq 'Return') { $btnFindSetting.RaiseEvent((New-Object System.Windows.RoutedEventArgs([System.Windows.Controls.Button]::ClickEvent))) }
+})
 
 $btnLoadDetails.Add_Click({
     $selected = $dgPolicies.SelectedItem
@@ -1225,12 +1910,44 @@ $btnExport.Add_Click({
 
     $formatItem = $cmbExportFormat.SelectedItem
     $formatText = if ($formatItem) { $formatItem.Content } else { 'JSON' }
-    $format = switch -Regex ($formatText) { 'CSV' { 'CSV' } 'HTML' { 'HTML' } default { 'JSON' } }
+    $format = switch -Regex ($formatText) {
+        'Audit' { 'AUDIT' }
+        'CSV'   { 'CSV' }
+        'HTML'  { 'HTML' }
+        default { 'JSON' }
+    }
+
+    if ($format -eq 'AUDIT' -and -not $Script:AnalysisData) {
+        $run = [System.Windows.MessageBox]::Show(
+            'Audit report requires tenant analysis. Run Analyze tenant on the Insights tab now?',
+            'Analysis required', 'YesNo', 'Question')
+        if ($run -ne 'Yes') { return }
+        try {
+            Set-Status 'Running analysis for audit export...'
+            $btnExport.IsEnabled = $false
+            $Script:AnalysisData = Invoke-TenantAnalysis -Policies @($Script:AllPolicies)
+            $Script:SettingsIndex = $Script:AnalysisData.SettingsIndex
+            $dgRecommendations.ItemsSource = $Script:AnalysisData.Recommendations
+            $dgHealth.ItemsSource          = $Script:AnalysisData.Health
+            $dgConflicts.ItemsSource       = $Script:AnalysisData.Conflicts
+            $Script:FilteredView.Refresh()
+        }
+        catch {
+            [System.Windows.MessageBox]::Show($_.Exception.Message, 'Analysis error', 'OK', 'Error') | Out-Null
+            $btnExport.IsEnabled = $Script:IsConnected
+            return
+        }
+    }
 
     try {
         Set-Status 'Exporting...'
         $btnExport.IsEnabled = $false
-        $paths = Export-Policies -Policies $toExport -Format $format -Folder $folder
+        if ($format -eq 'AUDIT') {
+            $paths = Export-AuditReport -Policies @($Script:AllPolicies) -Analysis $Script:AnalysisData -Folder $folder
+        }
+        else {
+            $paths = Export-Policies -Policies $toExport -Format $format -Folder $folder
+        }
         $txtExportResult.Text = "Export complete:`n$($paths -join "`n")"
         Set-Status 'Export complete.'
         $answer = [System.Windows.MessageBox]::Show(
