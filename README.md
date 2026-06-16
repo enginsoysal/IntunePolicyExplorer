@@ -3,11 +3,11 @@
 Open-source PowerShell GUI to **browse, analyze, search, and export** Microsoft Intune policies. Read-only — no policy changes.
 
 [![PowerShell Gallery](https://img.shields.io/powershellgallery/v/IntunePolicyExplorer.svg)](https://www.powershellgallery.com/packages/IntunePolicyExplorer)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
 - **Repository:** https://github.com/enginsoysal/IntunePolicyExplorer
 - **Gallery:** https://www.powershellgallery.com/packages/IntunePolicyExplorer
-- **License:** [MIT](LICENSE)
+- **License:** MIT
 
 ## Screenshots
 
@@ -152,15 +152,15 @@ git clone https://github.com/enginsoysal/IntunePolicyExplorer.git
 .\Show-IntunePoliciesGUI.ps1
 ```
 
-The main script is a single self-contained file: `Show-IntunePoliciesGUI.ps1`.  
-The `IntunePolicyExplorer/` folder is used for PowerShell Gallery publishing.
+This repository contains a single self-contained script: `Show-IntunePoliciesGUI.ps1`.
 
-Publish to Gallery:
+Install from Gallery for production use:
 
 ```powershell
-.\Publish-ToGallery.ps1 -ApiKey '<your-key>' -Version '1.3.0'
+Install-Module IntunePolicyExplorer -Scope CurrentUser -Force
+Show-IntunePoliciesGUI
 ```
 
 ## License
 
-MIT License — Copyright (c) 2026 Engin Soysal. See [LICENSE](LICENSE).
+MIT License — Copyright (c) 2026 Engin Soysal.

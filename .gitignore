@@ -7,6 +7,13 @@
 *.user
 *.suo
 
+# Gallery publish (local only, not in repo)
+IntunePolicyExplorer/
+Publish-ToGallery.ps1
+LICENSE
+Remove-GalleryVersions.ps1
+Unlist-GalleryVersions.ps1
+
 # OS
 Thumbs.db
 Desktop.ini
