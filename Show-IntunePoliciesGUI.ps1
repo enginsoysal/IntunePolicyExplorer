@@ -19,7 +19,7 @@ param()
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$Script:AppVersion = '1.3.0'
+$Script:AppVersion = '1.3.1'
 
 # Graph PowerShell built-in public client ID
 $Script:GraphClientId = '14d82eec-204b-4c2f-b7e8-296a70dab67e'
@@ -638,7 +638,7 @@ function Convert-PolicyToSettingsList {
     function Add-Row([string]$Category, [string]$Setting, $Value) {
         $display = if ($null -eq $Value) { '' }
                    elseif ($Value -is [string] -or $Value -is [ValueType]) { [string]$Value }
-                   else { ($Value | ConvertTo-Json -Depth 8 -Compress) }
+                   else { ($Value | ConvertTo-Json -Depth 20 -Compress) }
         $rows.Add([PSCustomObject]@{ Category = $Category; Setting = $Setting; Value = $display })
     }
 
@@ -688,7 +688,7 @@ function Format-SettingDisplayValue {
     param($Value)
     if ($null -eq $Value) { return '' }
     if ($Value -is [string] -or $Value -is [ValueType]) { return [string]$Value }
-    try { return ($Value | ConvertTo-Json -Depth 8 -Compress) }
+    try { return ($Value | ConvertTo-Json -Depth 20 -Compress) }
     catch { return [string]$Value }
 }
 
