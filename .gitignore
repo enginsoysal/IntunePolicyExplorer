@@ -7,10 +7,8 @@
 *.user
 *.suo
 
-# Gallery publish (local only, not in repo)
+# Legacy local build directory and maintenance helpers
 IntunePolicyExplorer/
-Publish-ToGallery.ps1
-LICENSE
 Remove-GalleryVersions.ps1
 Unlist-GalleryVersions.ps1
 
@@ -27,3 +25,5 @@ secrets.*
 # Build / publish artifacts
 *.nupkg
 publish/
+dist/
+tests/results/

@@ -52,7 +52,7 @@ cd IntunePolicyExplorer
 
 Click **Sign in with Microsoft**. No app registration required.
 
-On first run, `Microsoft.Graph.Authentication` is installed automatically if needed.
+On first run, you are prompted to install `Microsoft.Graph.Authentication` if it is missing.
 
 ## Who is this for?
 
@@ -66,19 +66,27 @@ Intune administrators who need more than the Intune portal list view:
 
 No custom Entra app registration is required for typical use.
 
-## Features (v1.3)
+## Features (v1.3.2)
 
 | Area | What you get |
 |------|----------------|
 | **Policies** | Unified list with type, platform, assignments, last modified |
 | **Settings** | Per-policy settings view from Microsoft Graph |
-| **Insights** | 16 recommendation checks (encryption, compliance, Defender, ASR, updates, Autopilot, MAM, …) |
+| **Insights** | Inventory recommendation checks (encryption, compliance, Defender, ASR, updates, Autopilot, MAM, …) |
 | **Policy health** | Unassigned policies, stale policies (>12 months), duplicate names |
-| **Conflicts** | Same setting configured with different values across policies |
+| **Potential conflicts** | Different values across distinct policies of the same type/platform/category; assignment overlap is not verified |
 | **Find setting** | Cross-policy search by setting name or value |
 | **Export** | JSON, CSV, HTML policy export + **HTML Audit Report** |
 
 Click **Analyze tenant** on the Insights tab to run the full analysis (loads assignments and policy details).
+
+## Understanding analysis results
+
+Version 1.3.2 distinguishes an empty result from a failed request. Unreadable assignments remain **Unknown**; only a successful empty assignment response produces **Unassigned**. Source, assignment and settings failures appear in **Policy health**, the coverage summary and the HTML audit report. Expanded settings collections follow their own pagination links.
+
+Recommendations are inventory hints, not a compliance score. **Info** means a policy or matching setting exists; it does not prove protection is enabled or deployed. **Warning** means no matching evidence was found in a fully collected inventory. **Unknown** means collection was incomplete. Potential conflicts require different policies and different values; effective group overlap, exclusions and filters are not evaluated. Comparisons stay within policy type/platform/category, so cross-type conflicts can be missed.
+
+Long forms scroll, policy actions wrap, and the initial window fits the available Windows work area. At small window sizes, use the page scrollbar to reach lower controls and the table scrollbar to inspect additional columns.
 
 ## Requirements
 
@@ -133,7 +141,7 @@ Unavailable types are skipped with a warning (depends on your permissions).
 | **HTML** | Readable per-policy documentation report |
 | **HTML Audit Report** | Recommendations, health findings, conflicts, and full policy inventory |
 
-Export selected policies or all loaded policies. The audit report always covers the full tenant analysis.
+Export selected policies or all loaded policies. The audit report always covers the analysis of the loaded inventory, including explicit coverage and collection errors.
 
 ## Troubleshooting
 
@@ -152,7 +160,7 @@ git clone https://github.com/enginsoysal/IntunePolicyExplorer.git
 .\Show-IntunePoliciesGUI.ps1
 ```
 
-This repository contains a single self-contained script: `Show-IntunePoliciesGUI.ps1`.
+The GUI remains a self-contained script: `Show-IntunePoliciesGUI.ps1`. Module metadata, the loader, build scripts and regression tests are tracked to make releases reproducible.
 
 Install from Gallery for production use:
 
@@ -160,6 +168,32 @@ Install from Gallery for production use:
 Install-Module IntunePolicyExplorer -Scope CurrentUser -Force
 Show-IntunePoliciesGUI
 ```
+
+## Reproduce and validate a release
+
+On Windows, from the repository root:
+
+```powershell
+powershell.exe -NoProfile -File tests/Test-Analysis.ps1
+pwsh.exe -NoProfile -File tests/Test-Analysis.ps1
+powershell.exe -NoProfile -STA -File tests/Test-Collections.ps1
+pwsh.exe -NoProfile -STA -File tests/Test-Collections.ps1
+powershell.exe -NoProfile -STA -File tests/Test-Layout.ps1
+powershell.exe -NoProfile -STA -File tests/Start-OfflinePreview.ps1 -RunChecks -Width 850 -Height 600
+pwsh.exe -NoProfile -STA -File tests/Start-OfflinePreview.ps1 -RunChecks -Width 640 -Height 480
+pwsh.exe -NoProfile -File scripts/Build-Release.ps1 -OutputDirectory dist/first
+pwsh.exe -NoProfile -File scripts/Build-Release.ps1 -OutputDirectory dist/second
+```
+
+The tests require no tenant or Graph module. The GUI harness uses synthetic Graph responses with the production XAML, bindings, events and exporters. Layout tests check all tabs, expanded forms, button labels, clipping and hit testing in 12 viewport/scale combinations, plus the device-code helper. Scaling is simulated through available DIP space; it does not change Windows DPI settings. GUI test renders and a machine-readable layout report are written to `tests/results/`.
+
+Compare `dist/first/SHA256SUMS.txt` and `dist/second/SHA256SUMS.txt`; they must match when built using the same PowerShell/.NET runtime. Builds normalize text encoding and line endings, use an explicit file allowlist, stable ZIP ordering and fixed entry timestamps. The package is under `dist/first/IntunePolicyExplorer/1.3.2/`, alongside the ZIP and SHA-256 checksums. No credentials or local publish helpers are packaged.
+
+For an interactive offline preview, run `tests/Start-OfflinePreview.ps1`. Its sign-in button loads fake data and makes no Microsoft authentication request.
+
+Before publishing, complete a real-tenant smoke test: sign in, refresh, inspect one policy of each accessible type, analyze and export the audit report. Verify native folder selection, keyboard navigation, and physical mouse clicks at the actual Windows DPI, including expanded advanced options. Automated fixture tests do not replace those checks.
+
+Publish the validated module directory with `Publish-Module -Path ./dist/first/IntunePolicyExplorer/1.3.2 -NuGetApiKey $env:PSGALLERY_API_KEY`. Keep the key outside source control. Create a matching `v1.3.2` tag and GitHub release with the ZIP, checksums and changelog from the same tested commit. The validation workflow builds artifacts; it does not publish automatically.
 
 ## License
 
