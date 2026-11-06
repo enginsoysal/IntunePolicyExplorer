@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
     Graphical Intune Policy Explorer - browse, search, and export Microsoft Intune policies.
@@ -19,7 +19,7 @@ param()
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$Script:AppVersion = '1.3.1'
+$Script:AppVersion = '1.3.2'
 
 # Graph PowerShell built-in public client ID
 $Script:GraphClientId = '14d82eec-204b-4c2f-b7e8-296a70dab67e'
@@ -151,6 +151,7 @@ $Script:CurrentTenant = $null
 $Script:OwnerWindow   = $null
 $Script:SettingsIndex = @()
 $Script:AnalysisData  = $null
+$Script:PolicyLoadErrors = @()
 
 function Test-GraphModule {
     return (@(Get-Module -ListAvailable -Name Microsoft.Graph.Authentication).Count -gt 0)
@@ -196,9 +197,10 @@ function Show-DeviceCodeDialog {
     $dialogXaml = @"
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Sign in to Microsoft Graph" Height="220" Width="540"
-        WindowStartupLocation="CenterOwner" ResizeMode="NoResize"
+        Title="Sign in to Microsoft Graph" Height="300" Width="540" MinWidth="380" MinHeight="200"
+        WindowStartupLocation="CenterOwner" ResizeMode="CanResize"
         Background="#F0F4F8" FontFamily="Segoe UI" ShowInTaskbar="False">
+  <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto">
   <Border Background="White" Margin="12" CornerRadius="8" BorderBrush="#D1D9E0" BorderThickness="1" Padding="14">
     <Grid>
       <Grid.RowDefinitions>
@@ -254,6 +256,7 @@ function Show-DeviceCodeDialog {
       </StackPanel>
     </Grid>
   </Border>
+  </ScrollViewer>
 </Window>
 "@
 
@@ -536,11 +539,11 @@ function Get-GraphProperty {
     )
     if ($null -eq $Object) { return $Default }
     if ($Object -is [System.Collections.IDictionary]) {
-        if ($Object.Contains($Name)) { return $Object[$Name] }
+        if ($Object.Contains($Name)) { return ,$Object[$Name] }
         return $Default
     }
     $prop = $Object.PSObject.Properties[$Name]
-    if ($prop) { return $prop.Value }
+    if ($prop) { return ,$prop.Value }
     return $Default
 }
 
@@ -563,7 +566,7 @@ function Invoke-GraphPaged {
             break
         }
         else {
-            break
+            throw "Unexpected Graph response from $next : expected a collection or object."
         }
         $next = Get-GraphProperty -Object $page -Name '@odata.nextLink'
     }
@@ -627,7 +630,17 @@ function Get-PolicyDetail {
     $expand = $Item.DetailExpand
     $uri    = "https://graph.microsoft.com/beta/$($Item.Endpoint)/$($Item.Id)"
     if ($expand) { $uri += "?`$expand=$expand" }
-    return Invoke-MgGraphRequest -Method GET -Uri $uri -OutputType PSObject
+    $detail = Invoke-MgGraphRequest -Method GET -Uri $uri -OutputType PSObject
+    # Expanded collections can have their own nextLink, independent of policy-list paging.
+    foreach ($collectionName in @('settings', 'definitionValues')) {
+        $nextLink = Get-GraphProperty -Object $detail -Name "$collectionName@odata.nextLink"
+        if ($nextLink) {
+            $initialValues = Get-GraphProperty -Object $detail -Name $collectionName
+            $allValues = @($initialValues) + @(Invoke-GraphPaged -Uri $nextLink)
+            $detail | Add-Member -NotePropertyName $collectionName -NotePropertyValue $allValues -Force
+        }
+    }
+    return $detail
 }
 
 function Convert-PolicyToSettingsList {
@@ -694,13 +707,9 @@ function Format-SettingDisplayValue {
 
 function Get-PolicyAssignments {
     param($Item)
-    try {
-        $uri = "https://graph.microsoft.com/beta/$($Item.Endpoint)/$($Item.Id)/assignments"
-        return @(Invoke-GraphPaged -Uri $uri)
-    }
-    catch {
-        return @()
-    }
+    # An inaccessible endpoint is unknown, never evidence of an unassigned policy.
+    $uri = "https://graph.microsoft.com/beta/$($Item.Endpoint)/$($Item.Id)/assignments"
+    return @(Invoke-GraphPaged -Uri $uri)
 }
 
 function New-RecommendationRow {
@@ -721,7 +730,10 @@ function New-RecommendationRow {
 }
 
 function Build-PolicySettingsIndex {
-    param([array]$Policies)
+    param(
+        [array]$Policies,
+        [System.Collections.Generic.List[object]]$LoadErrors = [System.Collections.Generic.List[object]]::new()
+    )
 
     $index = [System.Collections.Generic.List[object]]::new()
     $skipSettings = @(
@@ -732,7 +744,7 @@ function Build-PolicySettingsIndex {
     foreach ($p in $Policies) {
         try {
             $detail   = Get-PolicyDetail -Item $p
-            $settings = Convert-PolicyToSettingsList -Detail $detail -Type $p.Type
+            $settings = @(Convert-PolicyToSettingsList -Detail $detail -Type $p.Type)
             foreach ($s in $settings) {
                 if ($s.Setting -in $skipSettings) { continue }
                 $valueText = Format-SettingDisplayValue $s.Value
@@ -740,6 +752,7 @@ function Build-PolicySettingsIndex {
                     PolicyType = $p.Type
                     PolicyName = $p.Name
                     PolicyId   = $p.Id
+                    Platform   = $p.Platform
                     Category   = $s.Category
                     Setting    = $s.Setting
                     Value      = $valueText
@@ -748,7 +761,10 @@ function Build-PolicySettingsIndex {
             }
         }
         catch {
-            continue
+            $LoadErrors.Add([PSCustomObject]@{
+                Stage = 'Settings'; PolicyId = $p.Id; PolicyName = $p.Name
+                PolicyType = $p.Type; Message = $_.Exception.Message
+            })
         }
     }
     return @($index)
@@ -782,10 +798,10 @@ function Get-IntuneRecommendations {
     }
 
     if (Test-Blob 'osminimumversion|minversion|minimumos|operatingsystemversion') {
-        $rows.Add((New-RecommendationRow 'Pass' 'Compliance' 'Minimum OS version enforced' 'Compliance or configuration includes minimum OS settings.' 'Keep minimum versions aligned with vendor support lifecycles.'))
+        $rows.Add((New-RecommendationRow 'Pass' 'Compliance' 'Minimum OS version settings' 'Compliance or configuration includes minimum OS settings.' 'Keep minimum versions aligned with vendor support lifecycles.'))
     }
     else {
-        $rows.Add((New-RecommendationRow 'Warning' 'Compliance' 'Minimum OS version enforced' 'No explicit minimum OS setting detected.' 'Add a compliance policy with minimum OS version for supported platforms.'))
+        $rows.Add((New-RecommendationRow 'Warning' 'Compliance' 'Minimum OS version settings' 'No explicit minimum OS setting detected.' 'Add a compliance policy with minimum OS version for supported platforms.'))
     }
 
     if (Test-Blob 'bitlocker|encryption|requiredeviceencryption|personalvault|filevault') {
@@ -824,10 +840,10 @@ function Get-IntuneRecommendations {
     }
 
     if (Test-HasType 'Endpoint Security') {
-        $rows.Add((New-RecommendationRow 'Pass' 'Endpoint Security' 'Endpoint Security intents deployed' 'Endpoint Security policies are in use.' 'Map intents to Microsoft security baselines where possible.'))
+        $rows.Add((New-RecommendationRow 'Pass' 'Endpoint Security' 'Endpoint Security intents present' 'Endpoint Security policies are in use.' 'Map intents to Microsoft security baselines where possible.'))
     }
     else {
-        $rows.Add((New-RecommendationRow 'Warning' 'Endpoint Security' 'Endpoint Security intents deployed' 'No Endpoint Security policies found.' 'Use Endpoint Security for AV, disk encryption, firewall, and ASR templates.'))
+        $rows.Add((New-RecommendationRow 'Warning' 'Endpoint Security' 'Endpoint Security intents present' 'No Endpoint Security policies found.' 'Use Endpoint Security for AV, disk encryption, firewall, and ASR templates.'))
     }
 
     if (Test-HasType 'App Protection (iOS)') {
@@ -892,8 +908,8 @@ function Get-PolicyHealthFindings {
     $staleCutoff = (Get-Date).AddMonths(-12)
 
     foreach ($p in $Policies) {
-        $assignCount = if ($AssignmentMap.ContainsKey($p.Id)) { $AssignmentMap[$p.Id] } else { 0 }
-        if ($assignCount -eq 0) {
+        $assignCount = if ($AssignmentMap.ContainsKey($p.Id)) { $AssignmentMap[$p.Id] } else { $null }
+        if ($null -ne $assignCount -and $assignCount -eq 0) {
             $findings.Add([PSCustomObject]@{
                 Severity   = 'Warning'
                 PolicyName = $p.Name
@@ -933,25 +949,45 @@ function Get-PolicyHealthFindings {
     return @($findings)
 }
 
+function Get-SettingComparisonValue {
+    param([string]$Value)
+    if ($Value -notmatch '^\s*[\[{]') { return $Value }
+    try { $parsed = ConvertFrom-Json -InputObject $Value -ErrorAction Stop }
+    catch { return $Value }
+    function ConvertTo-ComparableObject($Object) {
+        if ($null -eq $Object -or $Object -is [string] -or $Object -is [ValueType]) { return $Object }
+        if ($Object -is [System.Collections.IList]) {
+            $items = @(foreach ($entry in $Object) { ConvertTo-ComparableObject $entry })
+            return ,$items
+        }
+        $properties = [ordered]@{}
+        foreach ($property in ($Object.PSObject.Properties | Sort-Object Name)) {
+            if ($property.Name -eq 'id' -or $property.Name -like '@odata.*') { continue }
+            $properties[$property.Name] = ConvertTo-ComparableObject $property.Value
+        }
+        return $properties
+    }
+    return (ConvertTo-ComparableObject $parsed | ConvertTo-Json -Depth 50 -Compress)
+}
+
 function Get-SettingConflicts {
     param([array]$SettingsIndex)
 
     $conflicts = [System.Collections.Generic.List[object]]::new()
-    $groups = $SettingsIndex | Where-Object { $_.Setting -and $_.Setting -notmatch '^@odata' } |
-        Group-Object -Property Setting |
-        Where-Object { $_.Count -gt 1 }
-
+    # Type and platform prevent unrelated settings with the same name being compared.
+    # This remains a potential conflict: effective assignment overlap is not evaluated.
+    $groups = $SettingsIndex | Where-Object {
+        $_.Setting -and $_.Setting -notmatch '^@odata' -and $_.Category -ne 'Info'
+    } | Group-Object -Property PolicyType, Platform, Category, Setting
     foreach ($g in $groups) {
-        $distinctValues = @($g.Group | Select-Object -ExpandProperty Value -Unique)
-        if ($distinctValues.Count -le 1) { continue }
-
-        $policyList = ($g.Group | ForEach-Object { "$($_.PolicyName) ($($_.PolicyType))" }) -join '; '
-        $valueList  = ($g.Group | ForEach-Object { $_.Value }) -join ' | '
+        $policyIds = @($g.Group | Select-Object -ExpandProperty PolicyId -Unique)
+        $distinctValues = @($g.Group | ForEach-Object { Get-SettingComparisonValue $_.Value } | Select-Object -Unique)
+        if ($policyIds.Count -lt 2 -or $distinctValues.Count -lt 2) { continue }
         $conflicts.Add([PSCustomObject]@{
-            Setting  = $g.Name
-            Policies = $policyList
-            Values   = $valueList
-            Detail   = "$($g.Count) policies configure '$($g.Name)' with $($distinctValues.Count) different values."
+            Setting  = $g.Group[0].Setting
+            Policies = ($g.Group | ForEach-Object { "$($_.PolicyName) ($($_.PolicyType))" }) -join '; '
+            Values   = ($g.Group | ForEach-Object { $_.Value }) -join ' | '
+            Detail   = "Potential conflict: $($policyIds.Count) policies contain different values. Assignment overlap, exclusions and filters have not been evaluated."
         })
     }
     return @($conflicts)
@@ -961,33 +997,70 @@ function Invoke-TenantAnalysis {
     param([array]$Policies)
 
     $assignmentMap = @{}
-    $total = $Policies.Count
+    $loadErrors = [System.Collections.Generic.List[object]]::new()
+    foreach ($message in $Script:PolicyLoadErrors) {
+        $loadErrors.Add([PSCustomObject]@{
+            Stage = 'Inventory'; PolicyId = ''; PolicyName = '(policy source)'
+            PolicyType = ''; Message = $message
+        })
+    }
     $i = 0
-
     foreach ($p in $Policies) {
         $i++
-        Set-Status "Analyzing assignments ($i/$total): $($p.Name)"
-        $assignments = Get-PolicyAssignments -Item $p
-        $assignmentMap[$p.Id] = @($assignments).Count
-        $p | Add-Member -NotePropertyName AssignmentCount -NotePropertyValue @($assignments).Count -Force
+        Set-Status "Analyzing assignments ($i/$($Policies.Count)): $($p.Name)"
+        $count = $null
+        try {
+            $assignments = @(Get-PolicyAssignments -Item $p)
+            $count = $assignments.Count
+        }
+        catch {
+            $loadErrors.Add([PSCustomObject]@{
+                Stage = 'Assignments'; PolicyId = $p.Id; PolicyName = $p.Name
+                PolicyType = $p.Type; Message = $_.Exception.Message
+            })
+        }
+        $assignmentMap[$p.Id] = $count
+        $p | Add-Member -NotePropertyName AssignmentCount -NotePropertyValue $count -Force
     }
 
     Set-Status 'Building settings index (this may take a while)...'
-    $settingsIndex = Build-PolicySettingsIndex -Policies $Policies
-
-    Set-Status 'Evaluating recommendations and conflicts...'
-    $recommendations = Get-IntuneRecommendations -Policies $Policies -SettingsIndex $settingsIndex
-    $health          = Get-PolicyHealthFindings -Policies $Policies -AssignmentMap $assignmentMap
-    $conflicts       = Get-SettingConflicts -SettingsIndex $settingsIndex
-
-    return [PSCustomObject]@{
-        SettingsIndex   = $settingsIndex
-        Recommendations = $recommendations
-        Health          = $health
-        Conflicts       = $conflicts
-        AssignmentMap   = $assignmentMap
-        AnalyzedAt      = Get-Date
+    $settingsIndex = @(Build-PolicySettingsIndex -Policies $Policies -LoadErrors $loadErrors)
+    $complete = $loadErrors.Count -eq 0
+    $recommendations = @(Get-IntuneRecommendations -Policies $Policies -SettingsIndex $settingsIndex)
+    # These are inventory heuristics, not proof of enabled or effective protection.
+    foreach ($r in $recommendations) {
+        if ($r.Status -eq 'Pass') {
+            $r.Status = 'Info'
+            $r.Detail += ' Presence only; enabled values and effective deployment are not verified.'
+        }
+        elseif (-not $complete) {
+            $r.Status = 'Unknown'
+            $r.Detail = 'Cannot determine absence: the analysis is incomplete. ' + $r.Detail
+        }
+        elseif ($r.Status -eq 'Fail') { $r.Status = 'Warning' }
     }
+    $health = @(Get-PolicyHealthFindings -Policies $Policies -AssignmentMap $assignmentMap)
+    foreach ($e in $loadErrors) {
+        $health += [PSCustomObject]@{
+            Severity = 'Warning'; PolicyName = $e.PolicyName; PolicyType = $e.PolicyType
+            Finding = "$($e.Stage) unavailable"; Detail = $e.Message
+        }
+    }
+    return [PSCustomObject]@{
+        SettingsIndex = $settingsIndex; Recommendations = $recommendations
+        Health = $health; Conflicts = @(Get-SettingConflicts -SettingsIndex $settingsIndex)
+        AssignmentMap = $assignmentMap; AnalyzedAt = Get-Date
+        IsComplete = $complete; LoadErrors = @($loadErrors)
+        PolicyCount = $Policies.Count
+        AssignmentsLoaded = @($assignmentMap.Values | Where-Object { $null -ne $_ }).Count
+        SettingsLoaded = $Policies.Count - @($loadErrors | Where-Object { $_.Stage -eq 'Settings' }).Count
+    }
+}
+
+function Get-AnalysisSummary {
+    param($Analysis)
+    $coverage = if ($Analysis.IsComplete) { 'Complete' } else { 'INCOMPLETE' }
+    return "$coverage analysis: $($Analysis.PolicyCount) loaded policies; assignments $($Analysis.AssignmentsLoaded)/$($Analysis.PolicyCount); settings $($Analysis.SettingsLoaded)/$($Analysis.PolicyCount); $($Analysis.LoadErrors.Count) load errors. Recommendations are inventory hints. Potential conflicts: $($Analysis.Conflicts.Count) (target overlap not verified). See Policy health for load errors."
 }
 
 function Search-PolicySettings {
@@ -1012,9 +1085,9 @@ function Export-AuditReport {
     $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
     $path      = Join-Path $Folder "IntuneAuditReport_$timestamp.html"
     $tenant    = $Script:CurrentTenant
-    $passCount = @($Analysis.Recommendations | Where-Object { $_.Status -eq 'Pass' }).Count
+    $infoCount = @($Analysis.Recommendations | Where-Object { $_.Status -eq 'Info' }).Count
     $warnCount = @($Analysis.Recommendations | Where-Object { $_.Status -eq 'Warning' }).Count
-    $failCount = @($Analysis.Recommendations | Where-Object { $_.Status -eq 'Fail' }).Count
+    $unknownCount = @($Analysis.Recommendations | Where-Object { $_.Status -eq 'Unknown' }).Count
 
     $sb = [System.Text.StringBuilder]::new()
     [void]$sb.AppendLine(@'
@@ -1035,8 +1108,15 @@ tr:hover td{background:#edf2f7}.meta{color:#64748b;font-size:.9rem}
 '@)
     [void]$sb.AppendLine('<h1>Intune Policy Audit Report</h1>')
     [void]$sb.AppendLine("<p class='meta'>Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm') | Tenant: $tenant | Policies: $($Policies.Count) | Version: $($Script:AppVersion)</p>")
-    [void]$sb.AppendLine("<div class='summary'><div class='card pass'><strong>$passCount</strong>Passed</div><div class='card warn'><strong>$warnCount</strong>Warnings</div><div class='card fail'><strong>$failCount</strong>Failed</div></div>")
+    [void]$sb.AppendLine("<div class='summary'><div class='card pass'><strong>$infoCount</strong>Informational</div><div class='card warn'><strong>$warnCount</strong>Warnings</div><div class='card fail'><strong>$unknownCount</strong>Unknown</div></div>")
 
+    [void]$sb.AppendLine("<p><strong>$([System.Web.HttpUtility]::HtmlEncode((Get-AnalysisSummary -Analysis $Analysis)))</strong></p>")
+    [void]$sb.AppendLine('<p>Inventory hints do not prove enabled protection or compliance. No potential conflicts found does not prove the tenant is conflict-free.</p>')
+    [void]$sb.AppendLine('<h2>Data collection errors</h2><table><tr><th>Stage</th><th>Policy/source</th><th>Error</th></tr>')
+    foreach ($e in $Analysis.LoadErrors) {
+        [void]$sb.AppendLine("<tr><td>$([System.Web.HttpUtility]::HtmlEncode($e.Stage))</td><td>$([System.Web.HttpUtility]::HtmlEncode($e.PolicyName))</td><td>$([System.Web.HttpUtility]::HtmlEncode($e.Message))</td></tr>")
+    }
+    [void]$sb.AppendLine('</table>')
     [void]$sb.AppendLine('<h2>Recommendations</h2><table><tr><th>Status</th><th>Category</th><th>Check</th><th>Detail</th><th>Advice</th></tr>')
     foreach ($r in $Analysis.Recommendations) {
         $cls = switch ($r.Status) { 'Pass' { 'pass' } 'Fail' { 'fail' } default { 'warn' } }
@@ -1050,7 +1130,7 @@ tr:hover td{background:#edf2f7}.meta{color:#64748b;font-size:.9rem}
     }
     [void]$sb.AppendLine('</table>')
 
-    [void]$sb.AppendLine('<h2>Setting Conflicts</h2><table><tr><th>Setting</th><th>Policies</th><th>Values</th><th>Detail</th></tr>')
+    [void]$sb.AppendLine('<h2>Potential Setting Conflicts</h2><table><tr><th>Setting</th><th>Policies</th><th>Values</th><th>Detail</th></tr>')
     foreach ($c in $Analysis.Conflicts) {
         [void]$sb.AppendLine("<tr><td>$([System.Web.HttpUtility]::HtmlEncode($c.Setting))</td><td>$([System.Web.HttpUtility]::HtmlEncode($c.Policies))</td><td><pre style='margin:0;white-space:pre-wrap'>$([System.Web.HttpUtility]::HtmlEncode($c.Values))</pre></td><td>$([System.Web.HttpUtility]::HtmlEncode($c.Detail))</td></tr>")
     }
@@ -1058,7 +1138,7 @@ tr:hover td{background:#edf2f7}.meta{color:#64748b;font-size:.9rem}
 
     [void]$sb.AppendLine('<h2>Policy Inventory</h2><table><tr><th>Type</th><th>Name</th><th>Platform</th><th>Assignments</th><th>Last modified</th></tr>')
     foreach ($p in ($Policies | Sort-Object Type, Name)) {
-        $ac = if ($null -ne $p.AssignmentCount) { $p.AssignmentCount } else { '-' }
+        $ac = if ($null -ne $p.AssignmentCount) { $p.AssignmentCount } else { 'Unknown' }
         [void]$sb.AppendLine("<tr><td>$([System.Web.HttpUtility]::HtmlEncode($p.Type))</td><td>$([System.Web.HttpUtility]::HtmlEncode($p.Name))</td><td>$([System.Web.HttpUtility]::HtmlEncode($p.Platform))</td><td>$ac</td><td>$([System.Web.HttpUtility]::HtmlEncode($p.Modified))</td></tr>")
     }
     [void]$sb.AppendLine('</table></body></html>')
@@ -1086,7 +1166,7 @@ function Export-Policies {
                     Name        = $p.Name
                     Id          = $p.Id
                     Description = $p.Description
-                    Settings    = Convert-PolicyToSettingsList -Detail $detail -Type $p.Type
+                    Settings    = @(Convert-PolicyToSettingsList -Detail $detail -Type $p.Type)
                     Raw         = $detail
                 }
             }
@@ -1139,7 +1219,7 @@ tr:hover td{background:#edf2f7}.meta{color:#64748b;font-size:.9rem}
                     [void]$sb.AppendLine("<p>$([System.Web.HttpUtility]::HtmlEncode($p.Description))</p>")
                 }
                 $detail   = Get-PolicyDetail -Item $p
-                $settings = Convert-PolicyToSettingsList -Detail $detail -Type $p.Type
+                $settings = @(Convert-PolicyToSettingsList -Detail $detail -Type $p.Type)
                 [void]$sb.AppendLine('<table><tr><th>Category</th><th>Setting</th><th>Value</th></tr>')
                 foreach ($s in $settings) {
                     [void]$sb.AppendLine("<tr><td>$([System.Web.HttpUtility]::HtmlEncode($s.Category))</td><td>$([System.Web.HttpUtility]::HtmlEncode($s.Setting))</td><td><pre style='margin:0;white-space:pre-wrap'>$([System.Web.HttpUtility]::HtmlEncode($s.Value))</pre></td></tr>")
@@ -1157,7 +1237,7 @@ tr:hover td{background:#edf2f7}.meta{color:#64748b;font-size:.9rem}
 $xaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Intune Policy Explorer" Height="880" Width="1180" MinHeight="720" MinWidth="900"
+        Title="Intune Policy Explorer" Height="800" Width="1180" MinHeight="480" MinWidth="640"
         WindowStartupLocation="CenterScreen" Background="#F0F4F8" FontFamily="Segoe UI">
   <Window.Resources>
     <SolidColorBrush x:Key="Primary" Color="#0078D4"/>
@@ -1253,6 +1333,7 @@ $xaml = @'
       <Setter Property="CanUserAddRows" Value="False"/>
       <Setter Property="SelectionMode" Value="Extended"/>
       <Setter Property="FontSize" Value="12.5"/>
+      <Setter Property="ScrollViewer.HorizontalScrollBarVisibility" Value="Auto"/>
     </Style>
   </Window.Resources>
 
@@ -1270,8 +1351,8 @@ $xaml = @'
           <ColumnDefinition Width="Auto"/>
         </Grid.ColumnDefinitions>
         <StackPanel>
-          <TextBlock Text="Intune Policy Explorer" FontSize="22" FontWeight="SemiBold" Foreground="White"/>
-          <TextBlock x:Name="TxtSubtitle" Text="Connect to Microsoft Graph to load policies" FontSize="13" Foreground="#B3D9F8" Margin="0,4,0,0"/>
+          <TextBlock TextWrapping="Wrap" Text="Intune Policy Explorer" FontSize="22" FontWeight="SemiBold" Foreground="White"/>
+          <TextBlock x:Name="TxtSubtitle" TextWrapping="Wrap" Text="Connect to Microsoft Graph to load policies" FontSize="13" Foreground="#B3D9F8" Margin="0,4,0,0"/>
         </StackPanel>
         <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
           <Ellipse x:Name="StatusDot" Width="10" Height="10" Fill="#FCA5A5" Margin="0,0,8,0"/>
@@ -1280,7 +1361,7 @@ $xaml = @'
       </Grid>
     </Border>
 
-    <TabControl Grid.Row="1" Margin="20,16,20,8">
+    <TabControl x:Name="MainTabs" Grid.Row="1" Margin="20,16,20,8">
       <TabItem>
         <TabItem.Header>
           <StackPanel Orientation="Horizontal">
@@ -1288,6 +1369,7 @@ $xaml = @'
             <TextBlock Text="Connection" VerticalAlignment="Center"/>
           </StackPanel>
         </TabItem.Header>
+        <ScrollViewer x:Name="ConnectionScroll" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
         <Border Background="{StaticResource Surface}" CornerRadius="10" Padding="20" Margin="0,8,0,0"
                 BorderBrush="{StaticResource Border}" BorderThickness="1">
           <Grid>
@@ -1340,6 +1422,7 @@ $xaml = @'
             </StackPanel>
           </Grid>
         </Border>
+        </ScrollViewer>
       </TabItem>
 
       <TabItem>
@@ -1349,37 +1432,33 @@ $xaml = @'
             <TextBlock Text="Policies" VerticalAlignment="Center"/>
           </StackPanel>
         </TabItem.Header>
-        <Grid Margin="0,8,0,0">
+        <ScrollViewer x:Name="PoliciesScroll" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+        <Grid Margin="0,8,0,0" MinHeight="420" Height="{Binding ViewportHeight, RelativeSource={RelativeSource AncestorType=ScrollViewer}}">
           <Grid.RowDefinitions>
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="*"/>
           </Grid.RowDefinitions>
           <Border Background="{StaticResource Surface}" CornerRadius="10" Padding="16" BorderBrush="{StaticResource Border}" BorderThickness="1" Margin="0,0,0,10">
-            <Grid>
-              <Grid.ColumnDefinitions>
-                <ColumnDefinition Width="*"/>
-                <ColumnDefinition Width="200"/>
-                <ColumnDefinition Width="Auto"/>
-                <ColumnDefinition Width="Auto"/>
-              </Grid.ColumnDefinitions>
-              <TextBox x:Name="TxtSearch" Grid.Column="0" Margin="0,0,10,0"/>
-              <ComboBox x:Name="CmbTypeFilter" Grid.Column="1" Margin="0,0,10,0"/>
-              <Button x:Name="BtnRefresh" Grid.Column="2" Content="Refresh" Margin="0,0,8,0" IsEnabled="False"/>
-              <Button x:Name="BtnLoadDetails" Grid.Column="3" Content="Load details" Style="{StaticResource SecondaryButton}" IsEnabled="False"/>
-            </Grid>
+            <WrapPanel>
+              <TextBox x:Name="TxtSearch" Width="220" Margin="0,0,10,6"/>
+              <ComboBox x:Name="CmbTypeFilter" Width="200" Margin="0,0,10,6"/>
+              <Button x:Name="BtnRefresh" Content="Refresh" Margin="0,0,8,6" IsEnabled="False"/>
+              <Button x:Name="BtnLoadDetails" Content="Load details" Margin="0,0,0,6" Style="{StaticResource SecondaryButton}" IsEnabled="False"/>
+            </WrapPanel>
           </Border>
           <Border Grid.Row="1" Background="{StaticResource Surface}" CornerRadius="10" BorderBrush="{StaticResource Border}" BorderThickness="1">
             <DataGrid x:Name="DgPolicies" IsReadOnly="True">
               <DataGrid.Columns>
-                <DataGridTextColumn Header="Type" Binding="{Binding Type}" Width="170"/>
+                <DataGridTextColumn Header="Type" Binding="{Binding Type}" Width="170" MinWidth="170"/>
                 <DataGridTextColumn Header="Name" Binding="{Binding Name}" Width="*" MinWidth="180"/>
-                <DataGridTextColumn Header="Platform" Binding="{Binding Platform}" Width="140"/>
-                <DataGridTextColumn Header="Assignments" Binding="{Binding AssignmentCount}" Width="90"/>
-                <DataGridTextColumn Header="Last modified" Binding="{Binding Modified}" Width="140"/>
+                <DataGridTextColumn Header="Platform" Binding="{Binding Platform}" Width="140" MinWidth="140"/>
+                <DataGridTextColumn Header="Assignments" Binding="{Binding AssignmentCount}" Width="90" MinWidth="90"/>
+                <DataGridTextColumn Header="Last modified" Binding="{Binding Modified}" Width="140" MinWidth="140"/>
               </DataGrid.Columns>
             </DataGrid>
           </Border>
         </Grid>
+        </ScrollViewer>
       </TabItem>
 
       <TabItem>
@@ -1389,27 +1468,29 @@ $xaml = @'
             <TextBlock Text="Settings" VerticalAlignment="Center"/>
           </StackPanel>
         </TabItem.Header>
-        <Grid Margin="0,8,0,0">
+        <ScrollViewer x:Name="SettingsScroll" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+        <Grid Margin="0,8,0,0" MinHeight="420" Height="{Binding ViewportHeight, RelativeSource={RelativeSource AncestorType=ScrollViewer}}">
           <Grid.RowDefinitions>
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="*"/>
           </Grid.RowDefinitions>
           <Border Background="{StaticResource Surface}" CornerRadius="10" Padding="16" BorderBrush="{StaticResource Border}" BorderThickness="1" Margin="0,0,0,10">
             <StackPanel>
-              <TextBlock x:Name="TxtSelectedPolicy" Text="Select a policy on the Policies tab" FontSize="15" FontWeight="SemiBold"/>
-              <TextBlock x:Name="TxtSelectedMeta" Foreground="{StaticResource TextMuted}" Margin="0,4,0,0"/>
+              <TextBlock x:Name="TxtSelectedPolicy" TextWrapping="Wrap" Text="Select a policy on the Policies tab" FontSize="15" FontWeight="SemiBold"/>
+              <TextBlock x:Name="TxtSelectedMeta" TextWrapping="Wrap" Foreground="{StaticResource TextMuted}" Margin="0,4,0,0"/>
             </StackPanel>
           </Border>
           <Border Grid.Row="1" Background="{StaticResource Surface}" CornerRadius="10" BorderBrush="{StaticResource Border}" BorderThickness="1">
             <DataGrid x:Name="DgSettings" IsReadOnly="True">
               <DataGrid.Columns>
-                <DataGridTextColumn Header="Category" Binding="{Binding Category}" Width="160"/>
+                <DataGridTextColumn Header="Category" Binding="{Binding Category}" Width="160" MinWidth="160"/>
                 <DataGridTextColumn Header="Setting" Binding="{Binding Setting}" Width="*" MinWidth="220"/>
                 <DataGridTextColumn Header="Value" Binding="{Binding Value}" Width="2*" MinWidth="280"/>
               </DataGrid.Columns>
             </DataGrid>
           </Border>
         </Grid>
+        </ScrollViewer>
       </TabItem>
 
       <TabItem>
@@ -1419,7 +1500,8 @@ $xaml = @'
             <TextBlock Text="Insights" VerticalAlignment="Center"/>
           </StackPanel>
         </TabItem.Header>
-        <Grid Margin="0,8,0,0">
+        <ScrollViewer x:Name="InsightsScroll" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+        <Grid Margin="0,8,0,0" MinHeight="420" Height="{Binding ViewportHeight, RelativeSource={RelativeSource AncestorType=ScrollViewer}}">
           <Grid.RowDefinitions>
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="*"/>
@@ -1430,21 +1512,23 @@ $xaml = @'
                 <ColumnDefinition Width="*"/>
                 <ColumnDefinition Width="Auto"/>
               </Grid.ColumnDefinitions>
-              <StackPanel>
-                <TextBlock Text="Tenant analysis" FontSize="15" FontWeight="SemiBold"/>
-                <TextBlock x:Name="TxtAnalysisSummary" Foreground="{StaticResource TextMuted}" TextWrapping="Wrap" Margin="0,4,0,0"
-                           Text="Run analysis for recommendations, policy health, setting conflicts, and cross-policy search."/>
-              </StackPanel>
+              <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+              </Grid.RowDefinitions>
+              <TextBlock Text="Tenant analysis" FontSize="15" FontWeight="SemiBold" VerticalAlignment="Center"/>
               <Button x:Name="BtnAnalyze" Grid.Column="1" Content="Analyze tenant" VerticalAlignment="Center" IsEnabled="False" MinWidth="140"/>
+              <TextBlock x:Name="TxtAnalysisSummary" Grid.Row="1" Grid.ColumnSpan="2" Foreground="{StaticResource TextMuted}" TextWrapping="Wrap" Margin="0,8,0,0"
+                         Text="Run analysis for recommendations, policy health, setting conflicts, and cross-policy search."/>
             </Grid>
           </Border>
           <Border Grid.Row="1" Background="{StaticResource Surface}" CornerRadius="10" BorderBrush="{StaticResource Border}" BorderThickness="1">
-            <TabControl Margin="8">
+            <TabControl x:Name="InsightTabs" Margin="8">
               <TabItem Header="Recommendations">
                 <DataGrid x:Name="DgRecommendations" IsReadOnly="True" Margin="4">
                   <DataGrid.Columns>
-                    <DataGridTextColumn Header="Status" Binding="{Binding Status}" Width="80"/>
-                    <DataGridTextColumn Header="Category" Binding="{Binding Category}" Width="130"/>
+                    <DataGridTextColumn Header="Status" Binding="{Binding Status}" Width="80" MinWidth="80"/>
+                    <DataGridTextColumn Header="Category" Binding="{Binding Category}" Width="130" MinWidth="130"/>
                     <DataGridTextColumn Header="Check" Binding="{Binding Title}" Width="*" MinWidth="200"/>
                     <DataGridTextColumn Header="Detail" Binding="{Binding Detail}" Width="2*" MinWidth="220"/>
                     <DataGridTextColumn Header="Advice" Binding="{Binding Advice}" Width="2*" MinWidth="220"/>
@@ -1454,15 +1538,15 @@ $xaml = @'
               <TabItem Header="Policy health">
                 <DataGrid x:Name="DgHealth" IsReadOnly="True" Margin="4">
                   <DataGrid.Columns>
-                    <DataGridTextColumn Header="Severity" Binding="{Binding Severity}" Width="90"/>
+                    <DataGridTextColumn Header="Severity" Binding="{Binding Severity}" Width="90" MinWidth="90"/>
                     <DataGridTextColumn Header="Policy" Binding="{Binding PolicyName}" Width="*" MinWidth="180"/>
-                    <DataGridTextColumn Header="Type" Binding="{Binding PolicyType}" Width="160"/>
-                    <DataGridTextColumn Header="Finding" Binding="{Binding Finding}" Width="120"/>
+                    <DataGridTextColumn Header="Type" Binding="{Binding PolicyType}" Width="160" MinWidth="160"/>
+                    <DataGridTextColumn Header="Finding" Binding="{Binding Finding}" Width="120" MinWidth="120"/>
                     <DataGridTextColumn Header="Detail" Binding="{Binding Detail}" Width="2*" MinWidth="220"/>
                   </DataGrid.Columns>
                 </DataGrid>
               </TabItem>
-              <TabItem Header="Conflicts">
+              <TabItem Header="Potential conflicts">
                 <DataGrid x:Name="DgConflicts" IsReadOnly="True" Margin="4">
                   <DataGrid.Columns>
                     <DataGridTextColumn Header="Setting" Binding="{Binding Setting}" Width="*" MinWidth="180"/>
@@ -1489,7 +1573,7 @@ $xaml = @'
                   <DataGrid x:Name="DgFindResults" Grid.Row="1" IsReadOnly="True">
                     <DataGrid.Columns>
                       <DataGridTextColumn Header="Policy" Binding="{Binding PolicyName}" Width="*" MinWidth="180"/>
-                      <DataGridTextColumn Header="Type" Binding="{Binding PolicyType}" Width="150"/>
+                      <DataGridTextColumn Header="Type" Binding="{Binding PolicyType}" Width="150" MinWidth="150"/>
                       <DataGridTextColumn Header="Setting" Binding="{Binding Setting}" Width="*" MinWidth="180"/>
                       <DataGridTextColumn Header="Value" Binding="{Binding Value}" Width="2*" MinWidth="220"/>
                     </DataGrid.Columns>
@@ -1499,6 +1583,7 @@ $xaml = @'
             </TabControl>
           </Border>
         </Grid>
+        </ScrollViewer>
       </TabItem>
 
       <TabItem>
@@ -1508,6 +1593,7 @@ $xaml = @'
             <TextBlock Text="Export" VerticalAlignment="Center"/>
           </StackPanel>
         </TabItem.Header>
+        <ScrollViewer x:Name="ExportScroll" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
         <Border Background="{StaticResource Surface}" CornerRadius="10" Padding="28" Margin="0,8,0,0"
                 BorderBrush="{StaticResource Border}" BorderThickness="1">
           <StackPanel MaxWidth="640" HorizontalAlignment="Left">
@@ -1519,7 +1605,7 @@ $xaml = @'
               <ComboBoxItem Content="JSON (full, including raw data)" IsSelected="True"/>
               <ComboBoxItem Content="CSV (overview + separate settings file)"/>
               <ComboBoxItem Content="HTML (readable report)"/>
-              <ComboBoxItem Content="HTML Audit Report (recommendations + health + conflicts)"/>
+              <ComboBoxItem Content="HTML Audit Report"/>
             </ComboBox>
             <TextBlock Text="Scope" FontWeight="SemiBold" Margin="0,0,0,6"/>
             <ComboBox x:Name="CmbExportScope" Width="280" HorizontalAlignment="Left" Margin="0,0,0,20">
@@ -1530,6 +1616,7 @@ $xaml = @'
             <TextBlock x:Name="TxtExportResult" Foreground="{StaticResource TextMuted}" Margin="0,16,0,0" TextWrapping="Wrap"/>
           </StackPanel>
         </Border>
+        </ScrollViewer>
       </TabItem>
     </TabControl>
 
@@ -1539,7 +1626,7 @@ $xaml = @'
           <ColumnDefinition Width="*"/>
           <ColumnDefinition Width="Auto"/>
         </Grid.ColumnDefinitions>
-        <TextBlock x:Name="TxtStatus" Text="Ready." VerticalAlignment="Center" Foreground="#475569"/>
+        <TextBlock x:Name="TxtStatus" Margin="0,0,12,0" ToolTip="{Binding Text, RelativeSource={RelativeSource Self}}" TextTrimming="CharacterEllipsis" Text="Ready." VerticalAlignment="Center" Foreground="#475569"/>
         <TextBlock x:Name="TxtPolicyCount" Grid.Column="1" Text="0 policies" VerticalAlignment="Center" Foreground="#475569"/>
       </Grid>
     </Border>
@@ -1557,6 +1644,11 @@ if (-not (Install-GraphModuleIfNeeded)) {
 $reader = [System.Xml.XmlReader]::Create([System.IO.StringReader]::new($xaml))
 $window = [Windows.Markup.XamlReader]::Load($reader)
 $Script:OwnerWindow = $window
+$workArea = [System.Windows.SystemParameters]::WorkArea
+$window.MinWidth = [Math]::Min($window.MinWidth, $workArea.Width)
+$window.MinHeight = [Math]::Min($window.MinHeight, $workArea.Height)
+$window.Width = [Math]::Min($window.Width, $workArea.Width)
+$window.Height = [Math]::Min($window.Height, $workArea.Height)
 
 $btnConnect         = $window.FindName('BtnConnect')
 $btnConnectAdvanced = $window.FindName('BtnConnectAdvanced')
@@ -1643,6 +1735,9 @@ function Set-Status([string]$Message) {
 }
 
 function Set-ConnectedUI([bool]$Connected, $Context = $null) {
+    # Every successful sign-in path must update both the internal state and the controls.
+    $Script:IsConnected = $Connected
+    $Script:CurrentTenant = if ($Connected -and $Context) { $Context.TenantId } else { $null }
     Invoke-OnUiThread {
         if ($Connected) {
             $statusDot.Fill = '#86EFAC'
@@ -1681,7 +1776,7 @@ function Show-PolicyLoadSummary {
         $Context
     )
 
-    if ($Count -gt 0 -or $Errors.Count -eq 0) { return }
+    if ($Errors.Count -eq 0) { return }
 
     $scopeHint = if (-not (Test-HasRequiredIntuneScopes -Context $Context)) {
         "`n`nYour sign-in token is missing Intune read scopes (DeviceManagement*.Read.All).`n" +
@@ -1691,8 +1786,8 @@ function Show-PolicyLoadSummary {
 
     $detail = if ($Errors.Count -gt 0) { "`n`nDetails:`n$($Errors -join "`n")" } else { '' }
     [void][System.Windows.MessageBox]::Show(
-        "Connected, but no policies could be loaded.$scopeHint$detail",
-        'No policies loaded', 'OK', 'Warning')
+        "Policy inventory is incomplete ($Count policies loaded). Some sources could not be read.$scopeHint$detail",
+        'Incomplete policy inventory', 'OK', 'Warning')
 }
 
 function Clear-AnalysisUI {
@@ -1725,12 +1820,9 @@ function Run-AnalysisAsync {
             $dgHealth.ItemsSource          = $analysis.Health
             $dgConflicts.ItemsSource       = $analysis.Conflicts
 
-            $pass = @($analysis.Recommendations | Where-Object { $_.Status -eq 'Pass' }).Count
-            $warn = @($analysis.Recommendations | Where-Object { $_.Status -eq 'Warning' }).Count
-            $fail = @($analysis.Recommendations | Where-Object { $_.Status -eq 'Fail' }).Count
-            $txtAnalysisSummary.Text = "Analyzed $($Script:AnalysisPolicies.Count) policies at $($analysis.AnalyzedAt.ToString('yyyy-MM-dd HH:mm')). Recommendations: $pass passed, $warn warnings, $fail failed. Health findings: $($analysis.Health.Count). Conflicts: $($analysis.Conflicts.Count)."
+            $txtAnalysisSummary.Text = Get-AnalysisSummary -Analysis $analysis
             $Script:FilteredView.Refresh()
-            Set-Status 'Analysis complete.'
+            Set-Status (Get-AnalysisSummary -Analysis $analysis)
         }
         catch {
             Set-Status "Analysis error: $($_.Exception.Message)"
@@ -1750,7 +1842,9 @@ function Load-PoliciesAsync {
         try {
             Clear-AnalysisUI
             $Script:AllPolicies.Clear()
+            $Script:PolicyLoadErrors = @('Inventory refresh did not finish.')
             $result = Get-AllIntunePolicies
+            $Script:PolicyLoadErrors = @($result.Errors)
             foreach ($p in ($result.Policies | Sort-Object Type, Name)) {
                 [void]$Script:AllPolicies.Add($p)
             }
@@ -1773,7 +1867,7 @@ function Show-PolicyDetails($Item) {
     Set-Status "Loading settings for '$($Item.Name)'..."
     try {
         $detail   = Get-PolicyDetail -Item $Item
-        $settings = Convert-PolicyToSettingsList -Detail $detail -Type $Item.Type
+        $settings = @(Convert-PolicyToSettingsList -Detail $detail -Type $Item.Type)
         $dgSettings.ItemsSource = $settings
         $txtSelectedPolicy.Text = $Item.Name
         $txtSelectedMeta.Text   = "Type: $($Item.Type)  |  ID: $($Item.Id)  |  $($settings.Count) settings"
@@ -1851,8 +1945,10 @@ $btnFindSetting.Add_Click({
         $Script:FindSettingQuery = $query
         $window.Dispatcher.InvokeAsync({
             try {
-                $Script:SettingsIndex = Build-PolicySettingsIndex -Policies @($Script:AllPolicies)
-                $dgFindResults.ItemsSource = Search-PolicySettings -Query $Script:FindSettingQuery -SettingsIndex $Script:SettingsIndex
+                $searchErrors = [System.Collections.Generic.List[object]]::new()
+                $Script:SettingsIndex = @(Build-PolicySettingsIndex -Policies @($Script:AllPolicies) -LoadErrors $searchErrors)
+                $txtAnalysisSummary.Text = "Search coverage: $($searchErrors.Count) settings load errors; $($Script:PolicyLoadErrors.Count) inventory errors. Run Analyze tenant for details."
+                $dgFindResults.ItemsSource = @(Search-PolicySettings -Query $Script:FindSettingQuery -SettingsIndex $Script:SettingsIndex)
                 Set-Status "Found $(@($dgFindResults.ItemsSource).Count) matches."
             }
             catch {
@@ -1864,7 +1960,7 @@ $btnFindSetting.Add_Click({
         }) | Out-Null
         return
     }
-    $dgFindResults.ItemsSource = Search-PolicySettings -Query $query -SettingsIndex $Script:SettingsIndex
+    $dgFindResults.ItemsSource = @(Search-PolicySettings -Query $query -SettingsIndex $Script:SettingsIndex)
     Set-Status "Found $(@($dgFindResults.ItemsSource).Count) matches."
 })
 
@@ -1892,7 +1988,8 @@ $btnExport.Add_Click({
     $scopeItem = $cmbExportScope.SelectedItem
     $scopeText = if ($scopeItem) { $scopeItem.Content } else { 'All loaded policies' }
 
-    if ($scopeText -match 'Selected') {
+    $isAudit = $cmbExportFormat.SelectedItem -and $cmbExportFormat.SelectedItem.Content -match 'Audit'
+    if ($scopeText -match 'Selected' -and -not $isAudit) {
         $toExport = @($dgPolicies.SelectedItems)
         if ($toExport.Count -eq 0) {
             [System.Windows.MessageBox]::Show('Select policies on the Policies tab first.', 'No selection', 'OK', 'Warning') | Out-Null
@@ -1930,6 +2027,7 @@ $btnExport.Add_Click({
             $dgRecommendations.ItemsSource = $Script:AnalysisData.Recommendations
             $dgHealth.ItemsSource          = $Script:AnalysisData.Health
             $dgConflicts.ItemsSource       = $Script:AnalysisData.Conflicts
+            $txtAnalysisSummary.Text = Get-AnalysisSummary -Analysis $Script:AnalysisData
             $Script:FilteredView.Refresh()
         }
         catch {

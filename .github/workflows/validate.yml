@@ -1,0 +1,45 @@
+name: Validate release
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Windows PowerShell 5.1 regressions
+        shell: powershell
+        run: ./tests/Test-Analysis.ps1
+      - name: PowerShell 7 regressions
+        shell: pwsh
+        run: ./tests/Test-Analysis.ps1
+      - name: Zero, one and multiple rows in WPF tables (PowerShell 5.1)
+        shell: powershell
+        run: ./tests/Test-Collections.ps1
+      - name: Zero, one and multiple rows in WPF tables (PowerShell 7)
+        shell: pwsh
+        run: ./tests/Test-Collections.ps1
+      - name: WPF layout at multiple sizes and scales
+        shell: powershell
+        run: ./tests/Test-Layout.ps1
+      - name: GUI events and exports with synthetic data (PowerShell 5.1)
+        shell: powershell
+        run: ./tests/Start-OfflinePreview.ps1 -RunChecks -Width 850 -Height 600
+      - name: GUI events and exports at minimum size (PowerShell 7)
+        shell: pwsh
+        run: ./tests/Start-OfflinePreview.ps1 -RunChecks -Width 640 -Height 480
+      - name: Build twice and verify reproducibility
+        shell: pwsh
+        run: |
+          ./scripts/Build-Release.ps1 -OutputDirectory ./dist/first
+          ./scripts/Build-Release.ps1 -OutputDirectory ./dist/second
+          $a = Get-Content ./dist/first/SHA256SUMS.txt -Raw
+          $b = Get-Content ./dist/second/SHA256SUMS.txt -Raw
+          if ($a -cne $b) { throw 'Builds are not reproducible.' }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: IntunePolicyExplorer-1.3.2
+          path: dist/first/*
